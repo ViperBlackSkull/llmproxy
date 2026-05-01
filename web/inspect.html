@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>LLM Proxy Inspector</title>
+<meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, system-ui, sans-serif; background: #1a1a2e; color: #eee; padding: 20px; }
+  h1 { margin-bottom: 20px; color: #e94560; }
+  .entry { background: #16213e; border-radius: 8px; margin-bottom: 12px; overflow: hidden; cursor: pointer; border: 1px solid #0f3460; }
+  .entry:hover { border-color: #e94560; }
+  .entry-header { padding: 12px 16px; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+  .badge { padding: 3px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
+  .badge-anthropic { background: #d4a574; color: #1a1a2e; }
+  .badge-openai { background: #74b9ff; color: #1a1a2e; }
+  .badge-unknown { background: #636e72; }
+  .time { color: #b2bec3; font-size: 13px; }
+  .model { color: #00cec9; font-size: 13px; }
+  .entry-detail { display: none; padding: 0 16px 16px; border-top: 1px solid #0f3460; }
+  .entry.open .entry-detail { display: block; }
+  .entry-detail pre { background: #0a0a1a; padding: 12px; border-radius: 6px; overflow-x: auto; white-space: pre-wrap; word-wrap: break-word; font-size: 13px; line-height: 1.5; max-height: 600px; overflow-y: auto; margin-top: 8px; }
+  .section-title { color: #e94560; font-size: 13px; font-weight: 600; margin-top: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .system-preview { color: #ffeaa7; font-size: 12px; max-height: 40px; overflow: hidden; }
+  .tabs { display: flex; gap: 4px; margin-top: 8px; }
+  .tab { padding: 4px 10px; border-radius: 4px; font-size: 12px; cursor: pointer; background: #0f3460; border: none; color: #eee; }
+  .tab.active { background: #e94560; }
+  .empty { text-align: center; padding: 40px; color: #636e72; }
+</style>
+</head>
+<body>
+<h1>LLM Proxy Inspector</h1>
+{{if .Entries}}
+  {{range .Entries}}
+  <div class="entry" onclick="toggleEntry(this)" data-file="{{.Filename}}">
+    <div class="entry-header">
+      <span class="badge badge-{{.API}}">{{.API}}</span>
+      <span class="model">{{.Model}}</span>
+      <span class="time">{{.Time}}</span>
+      {{if .System}}<span class="system-preview">{{.System}}</span>{{end}}
+    </div>
+    <div class="entry-detail">
+      <div class="tabs">
+        <button class="tab active" onclick="showTab(this,'rendered')">Rendered</button>
+        <button class="tab" onclick="showTab(this,'raw')">Raw JSON</button>
+      </div>
+      <div class="tab-content rendered"><pre></pre></div>
+      <div class="tab-content raw" style="display:none"><pre></pre></div>
+    </div>
+  </div>
+  {{end}}
+{{else}}
+  <div class="empty">No captured requests yet. Run a command through the proxy.</div>
+{{end}}
+<script>
+function toggleEntry(el) {
+  el.classList.toggle('open');
+  if (el.classList.contains('open') && !el.dataset.loaded) {
+    el.dataset.loaded = '1';
+    fetch('/__inspect__/api/' + el.dataset.file)
+      .then(r => r.json())
+      .then(data => {
+        el.querySelector('.rendered pre').textContent = data.markdown || '(empty)';
+        el.querySelector('.raw pre').textContent = data.request ? JSON.stringify(JSON.parse(data.request), null, 2) : '(no raw data)';
+      });
+  }
+}
+function showTab(btn, name) {
+  const detail = btn.closest('.entry-detail');
+  detail.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  btn.classList.add('active');
+  detail.querySelectorAll('.tab-content').forEach(c => c.style.display = 'none');
+  detail.querySelector('.' + name).style.display = '';
+}
+</script>
+</body>
+</html>

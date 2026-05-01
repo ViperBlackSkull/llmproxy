@@ -1,0 +1,18 @@
+# Binary (build with: make build)
+llmproxyd
+
+# Logs
+logs/
+
+# Go
+*.exe
+*.test
+*.out
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp files
+*.tmp
+*.log

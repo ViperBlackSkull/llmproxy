@@ -1,0 +1,144 @@
+#!/bin/bash
+
+# llmproxy - LLM proxy wrapper (proxychains style)
+# Intercepts all LLM API traffic transparently by:
+#   1. Modifying ~/.claude/settings.json to point to local proxy
+#   2. Running the command
+#   3. Restoring settings.json
+#   4. Printing captured request/response logs
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/logs}"
+
+# Subcommands
+if [[ "${1:-}" == "logs" ]]; then
+    shift
+    mkdir -p "$LOG_DIR"
+    if [[ $# -gt 0 && "$1" == "open" ]]; then
+        # Start inspect server on historical logs
+        PORT="${2:-8777}"
+        echo "Inspect dashboard: http://localhost:$PORT/__inspect__" >&2
+        echo "Press Ctrl+C to stop" >&2
+        LOG_DIR="$LOG_DIR" LISTEN_ADDR=":$PORT" BACKEND_URL="http://localhost" "$SCRIPT_DIR/llmproxyd"
+        exit $?
+    fi
+    # List logs
+    if ls "$LOG_DIR"/*.md &>/dev/null; then
+        for f in "$LOG_DIR"/*.md; do
+            basename "$f"
+        done | sort -r
+    else
+        echo "No logs found in $LOG_DIR"
+    fi
+    exit 0
+fi
+
+if [[ "${1:-}" == "inspect" ]]; then
+    shift
+    mkdir -p "$LOG_DIR"
+    PORT="${1:-8777}"
+    echo "Inspect dashboard: http://localhost:$PORT/__inspect__" >&2
+    echo "Press Ctrl+C to stop" >&2
+    LOG_DIR="$LOG_DIR" LISTEN_ADDR=":$PORT" BACKEND_URL="http://localhost" "$SCRIPT_DIR/llmproxyd"
+    exit $?
+fi
+
+if [[ $# -eq 0 ]]; then
+    echo "Usage: llmproxy <command> [args...]"
+    echo "       llmproxy logs [open]"
+    echo "       llmproxy inspect [port]"
+    echo ""
+    echo "Commands:"
+    echo "  claude -p 'hello'   Run claude through the proxy"
+    echo "  logs                 List captured logs"
+    echo "  logs open            Open inspect dashboard on historical logs"
+    echo "  inspect [port]       Open inspect dashboard (default port: 8777)"
+    exit 1
+fi
+
+# Determine backend URL
+SETTINGS_FILE="$HOME/.claude/settings.json"
+BACKEND_URL="${BACKEND_URL:-}"
+if [[ -z "$BACKEND_URL" && -f "$SETTINGS_FILE" ]]; then
+    BACKEND_URL=$(jq -r '.env.ANTHROPIC_BASE_URL // empty' "$SETTINGS_FILE" 2>/dev/null)
+fi
+BACKEND_URL="${BACKEND_URL:-https://api.anthropic.com}"
+BACKEND_URL="${BACKEND_URL%/}"
+
+mkdir -p "$LOG_DIR"
+
+# Find proxy daemon
+PROXYD="$SCRIPT_DIR/llmproxyd"
+if [[ ! -x "$PROXYD" ]]; then
+    echo "Error: Cannot find llmproxyd binary" >&2
+    exit 1
+fi
+
+# Find available port
+PROXY_PORT=""
+for port in 8765 8766 8767 8768 8769 8770; do
+    if ! lsof -i :$port >/dev/null 2>&1; then
+        PROXY_PORT=$port
+        break
+    fi
+done
+
+if [[ -z "$PROXY_PORT" ]]; then
+    echo "Error: No available port found" >&2
+    exit 1
+fi
+
+PROXY_URL="http://localhost:$PROXY_PORT"
+
+# Start proxy daemon
+BACKEND_URL="$BACKEND_URL" \
+LISTEN_ADDR=":$PROXY_PORT" \
+LOG_DIR="$LOG_DIR" \
+"$PROXYD" &
+PROXY_PID=$!
+
+sleep 0.3
+
+if ! kill -0 $PROXY_PID 2>/dev/null; then
+    echo "Error: Proxy failed to start" >&2
+    exit 1
+fi
+
+# Backup and modify settings.json to point to proxy
+SETTINGS_BACKUP=""
+if [[ -f "$SETTINGS_FILE" ]]; then
+    SETTINGS_BACKUP=$(mktemp)
+    cp "$SETTINGS_FILE" "$SETTINGS_BACKUP"
+    jq --arg url "$PROXY_URL" '.env.ANTHROPIC_BASE_URL = $url' "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp"
+    mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
+fi
+
+cleanup() {
+    # Restore settings.json
+    if [[ -n "$SETTINGS_BACKUP" && -f "$SETTINGS_BACKUP" ]]; then
+        mv "$SETTINGS_BACKUP" "$SETTINGS_FILE"
+    fi
+    # Kill proxy
+    kill $PROXY_PID 2>/dev/null || true
+    wait $PROXY_PID 2>/dev/null || true
+    # Print summary
+    local count=0
+    for f in "$LOG_DIR"/*.md; do
+        if [[ -f "$f" ]]; then
+            count=$((count + 1))
+        fi
+    done
+    if [[ $count -gt 0 ]]; then
+        echo "" >&2
+        echo "Captured $count request(s). Inspect: llmproxy inspect" >&2
+    fi
+}
+trap cleanup EXIT
+
+# Run the command
+"$@"
+EXIT_CODE=$?
+
+exit $EXIT_CODE
