@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 854 480" width="854" height="480">
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&amp;display=swap');
+    text { font-family: 'JetBrains Mono', 'Menlo', 'DejaVu Sans Mono', monospace; }
+    .fg { fill: #e4e4e4; }
+    .fg-green { fill: #6bbf6b; }
+    .fg-yellow { fill: #d4d4aa; }
+    .fg-cyan { fill: #6bbfbf; }
+    .fg-red { fill: #bf6b6b; }
+    .fg-bright { fill: #ffffff; font-weight: 700; }
+    .dim { fill: #666666; }
+    .prompt { fill: #6bbf6b; font-weight: 700; }
+  </style>
+  <rect width="854" height="480" rx="8" fill="#1a1a2e"/>
+  <!-- Title bar -->
+  <rect width="854" height="34" rx="8" fill="#16213e"/>
+  <rect y="16" width="854" height="18" fill="#16213e"/>
+  <circle cx="18" cy="17" r="6" fill="#e94560"/>
+  <circle cx="38" cy="17" r="6" fill="#d4a574"/>
+  <circle cx="58" cy="17" r="6" fill="#6bbf6b"/>
+  <text x="427" y="22" text-anchor="middle" font-size="13" fill="#888">llmproxy demo</text>
+
+  <!-- Terminal content -->
+  <g transform="translate(20, 52)">
+    <!-- Frame 1: Run claude through proxy -->
+    <text y="0" font-size="14">
+      <tspan class="prompt">$</tspan>
+      <tspan class="fg"> </tspan>
+      <tspan class="fg-bright">llmproxy claude -p</tspan>
+      <tspan class="fg-yellow"> "what is 2+2?"</tspan>
+    </text>
+
+    <text y="24" font-size="14" class="dim">
+      2026/04/30 22:00:00 LLM Proxy listening on :8765, forwarding to api.anthropic.com
+    </text>
+    <text y="44" font-size="14" class="fg-cyan">
+      [llmproxy] agent=claude backend=https://api.anthropic.com proxy=:8765
+    </text>
+
+    <text y="76" font-size="14" class="fg">
+      -&gt; POST /v1/messages (2847 bytes)
+    </text>
+    <text y="96" font-size="14" class="fg">
+      &lt;- 200 /v1/messages
+    </text>
+    <text y="116" font-size="14" class="fg">
+      Logged request to logs/20260430-220000-anthropic.md
+    </text>
+
+    <text y="148" font-size="14" class="fg">
+      4
+    </text>
+    <text y="168" font-size="14" class="fg">
+      2 + 2 equals 4.
+    </text>
+
+    <text y="200" font-size="14">
+      <tspan class="dim">[claude] Captured 1 request(s). Inspect: llmproxy inspect</tspan>
+    </text>
+
+    <!-- Frame 2: Inspect dashboard -->
+    <text y="236" font-size="14">
+      <tspan class="prompt">$</tspan>
+      <tspan class="fg"> </tspan>
+      <tspan class="fg-bright">llmproxy inspect</tspan>
+    </text>
+    <text y="256" font-size="14" class="dim">
+      Inspect dashboard: http://localhost:8777/__inspect__
+    </text>
+
+    <!-- Frame 3: List logs -->
+    <text y="288" font-size="14">
+      <tspan class="prompt">$</tspan>
+      <tspan class="fg"> </tspan>
+      <tspan class="fg-bright">llmproxy logs</tspan>
+    </text>
+    <text y="308" font-size="14" class="fg-yellow">
+      20260430-220000-anthropic.md
+    </text>
+
+    <!-- Frame 4: Cat a log -->
+    <text y="340" font-size="14">
+      <tspan class="prompt">$</tspan>
+      <tspan class="fg"> </tspan>
+      <tspan class="fg-bright">cat</tspan>
+      <tspan class="fg"> logs/20260430-220000-anthropic.md</tspan>
+    </text>
+
+    <text y="364" font-size="14">
+      <tspan class="fg-red"># LLM Request</tspan>
+    </text>
+    <text y="382" font-size="14" class="fg">
+      <tspan class="dim">**Time**:</tspan> 2026-04-30T22:00:00Z
+    </text>
+    <text y="398" font-size="14" class="fg">
+      <tspan class="dim">**API**:</tspan> anthropic
+    </text>
+    <text y="414" font-size="14" class="fg">
+      <tspan class="dim">**Model**:</tspan> claude-sonnet-4-20250514
+    </text>
+  </g>
+</svg>

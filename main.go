@@ -298,11 +298,14 @@ func proxyAndCapture(w http.ResponseWriter, resp *http.Response, logBase string,
 }
 
 func detectAPIType(path string, body []byte) string {
-	if strings.Contains(path, "chat/completions") {
+	if strings.Contains(path, "chat/completions") || strings.Contains(path, "/responses") {
 		return "openai"
 	}
 	if strings.Contains(path, "/messages") {
 		return "anthropic"
+	}
+	if strings.Contains(path, "generateContent") || strings.Contains(path, "streamGenerateContent") {
+		return "gemini"
 	}
 	return "unknown"
 }

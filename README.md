@@ -1,21 +1,27 @@
 # llmproxy
 
-A transparent reverse proxy that intercepts and logs LLM API requests. Works like `proxychains` — wrap any command and it captures all prompt traffic in markdown format.
+A transparent reverse proxy that intercepts and logs LLM API requests from any coding agent. Works like `proxychains` — wrap your command and it captures all prompt traffic.
 
-Supports both **Anthropic** and **OpenAI** compatible APIs, including streaming responses.
+Supports **Anthropic**, **OpenAI**, and **Gemini** APIs, including streaming responses.
 
-## Features
+<p align="center">
+  <img src="demo/demo.svg" alt="llmproxy demo" width="854">
+</p>
 
-- Transparent proxying — your tool doesn't know it's there
-- Captures system prompts, messages, and responses
-- Streaming support (SSE) with real-time capture
-- Built-in web dashboard for inspecting logs
-- Markdown-formatted logs, raw JSON preserved
-- Works with Claude Code, Codex, or any tool that calls LLM APIs
+## Supported Agents
+
+| Agent | Command | Auto-detected |
+|-------|---------|:---:|
+| Claude Code | `llmproxy claude -p "hello"` | Yes |
+| OpenAI Codex | `llmproxy codex "fix the bug"` | Yes |
+| Aider | `llmproxy aider --model gpt-4o "refactor"` | Yes |
+| OpenCode | `llmproxy opencode` | Yes |
+| Gemini CLI | `llmproxy gemini -p "explain this"` | Yes |
+| Any other | `llmproxy <command> [args...]` | Best-effort |
 
 ## Install
 
-Requirements: [Go](https://go.dev/) 1.22+, `jq`, `lsof`
+Requirements: [Go](https://go.dev/) 1.22+, `jq` (for Claude Code only)
 
 ```bash
 git clone https://github.com/ViperBlackSkull/llmproxy.git
@@ -26,14 +32,29 @@ make build
 ## Usage
 
 ```bash
-# Run any command through the proxy
+# Claude Code
 ./llmproxy claude -p "hello"
+
+# OpenAI Codex
 ./llmproxy codex "fix the bug"
+
+# Aider (auto-detects OpenAI or Anthropic based on --model)
+./llmproxy aider --model gpt-4o "refactor auth"
+./llmproxy aider --model claude-sonnet-4-20250514 "fix tests"
+
+# OpenCode
+./llmproxy opencode
+
+# Gemini CLI
+./llmproxy gemini -p "explain this code"
+
+# Any command — sets all known env vars
+./llmproxy curl -X POST http://localhost:8765/v1/messages ...
 
 # List captured logs
 ./llmproxy logs
 
-# Open the inspect dashboard
+# Open inspect dashboard
 ./llmproxy inspect
 ```
 
@@ -64,31 +85,35 @@ All config via environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BACKEND_URL` | `ANTHROPIC_BASE_URL` or `https://api.anthropic.com` | Upstream API to forward to |
-| `LISTEN_ADDR` | `:8765` | Proxy listen address |
+| `BACKEND_URL` | Auto-detected per agent | Upstream API to forward to |
+| `PROXY_PORT` | First available from 8765-8770 | Proxy listen port |
 | `LOG_DIR` | `./logs` | Directory for captured logs |
+| `LISTEN_ADDR` | `:8765` | Proxy listen address (standalone mode) |
 
 ## How It Works
 
 ```
-Tool (claude, codex, etc.)
+Agent (claude, codex, aider, etc.)
   │
-  ├── settings.json patched to point at local proxy
+  ├── Env vars set to point at local proxy
+  │   (Claude Code: also patches settings.json)
   │
   ▼
 llmproxyd (:8765)
+  ├── Detects API type (Anthropic / OpenAI / Gemini)
   ├── Logs request (system prompt, messages)
   ├── Forwards to real API
   ├── Captures response (including SSE streams)
   └── Logs response
   │
   ▼
-api.anthropic.com / api.openai.com
+api.anthropic.com / api.openai.com / generativelanguage.googleapis.com
 ```
 
-1. `llmproxy` wrapper starts the daemon, patches your tool's config to route through it
-2. `llmproxyd` intercepts requests, logs them as markdown, forwards to the real API
-3. On exit, settings are restored and a summary is printed
+1. `llmproxy` wrapper detects which agent you're running
+2. Sets the appropriate env vars so the agent routes through the proxy
+3. `llmproxyd` intercepts requests, logs them as markdown, forwards to the real API
+4. On exit, settings are restored and a summary is printed
 
 ## Log Format
 
