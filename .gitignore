@@ -16,3 +16,8 @@ Thumbs.db
 # Temp files
 *.tmp
 *.log
+llmproxy
+
+# Compiled libs
+lib/intercept
+lib/redirect.so
