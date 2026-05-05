@@ -1,8 +1,27 @@
 # llmproxy
 
-A transparent reverse proxy that intercepts and logs LLM API requests from any coding agent. Works like `proxychains` — wrap your command and it captures all prompt traffic.
+A transparent reverse proxy that intercepts and logs LLM API requests from any coding agent. Inspired by [proxychains](https://github.com/haad/proxychains) — just wrap your command and it captures all prompt traffic, including hidden system prompts.
 
-Supports **Anthropic**, **OpenAI**, and **Gemini** APIs, including streaming responses.
+Supports **Anthropic**, **OpenAI**, and **Gemini** APIs, including streaming responses and WebSocket-based Realtime API.
+
+## System Prompt Extraction
+
+llmproxy can extract and save the **full system prompts** that coding agents send to LLMs — prompts that are normally hidden from the user. Every request is inspected and the system prompt is saved to a per-agent snapshot file:
+
+```
+logs/
+├── claude/
+│   ├── prompt.md          ← current Claude Code system prompt
+│   └── prompt-20260505-*.md
+├── codex/
+│   ├── prompt.md          ← current Codex system prompt
+│   └── ...
+```
+
+Works across all supported agents and API formats:
+- **Anthropic**: extracts the `system` field (string and content block arrays)
+- **OpenAI**: extracts `system` role messages from the `messages` array
+- **Codex (WebSocket)**: extracts the `instructions` field from Realtime API events
 
 <p align="center">
   <img src="demo/demo.svg" alt="llmproxy demo" width="854">
@@ -92,6 +111,8 @@ All config via environment variables:
 
 ## How It Works
 
+Inspired by [proxychains](https://github.com/haad/proxychains): instead of chaining through SOCKS/HTTP proxies, llmproxy chains your coding agent through a local intercepting proxy that logs all LLM traffic — no agent configuration or plugins required.
+
 ```
 Agent (claude, codex, aider, etc.)
   │
@@ -101,6 +122,7 @@ Agent (claude, codex, aider, etc.)
   ▼
 llmproxyd (:8765)
   ├── Detects API type (Anthropic / OpenAI / Gemini)
+  ├── Extracts system prompt (saves to prompt.md)
   ├── Logs request (system prompt, messages)
   ├── Forwards to real API
   ├── Captures response (including SSE streams)
