@@ -13,7 +13,9 @@
   .badge { padding: 3px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
   .badge-anthropic { background: #d4a574; color: #1a1a2e; }
   .badge-openai { background: #74b9ff; color: #1a1a2e; }
+  .badge-gemini { background: #a29bfe; color: #1a1a2e; }
   .badge-unknown { background: #636e72; }
+  .badge-agent { background: #00b894; color: #1a1a2e; }
   .time { color: #b2bec3; font-size: 13px; }
   .model { color: #00cec9; font-size: 13px; }
   .entry-detail { display: none; padding: 0 16px 16px; border-top: 1px solid #0f3460; }
@@ -31,8 +33,9 @@
 <h1>LLM Proxy Inspector</h1>
 {{if .Entries}}
   {{range .Entries}}
-  <div class="entry" onclick="toggleEntry(this)" data-file="{{.Filename}}">
+  <div class="entry" onclick="toggleEntry(this)" data-file="{{.Filename}}" data-agent="{{.Agent}}">
     <div class="entry-header">
+      {{if .Agent}}<span class="badge badge-agent">{{.Agent}}</span>{{end}}
       <span class="badge badge-{{.API}}">{{.API}}</span>
       <span class="model">{{.Model}}</span>
       <span class="time">{{.Time}}</span>
@@ -56,7 +59,9 @@ function toggleEntry(el) {
   el.classList.toggle('open');
   if (el.classList.contains('open') && !el.dataset.loaded) {
     el.dataset.loaded = '1';
-    fetch('/__inspect__/api/' + el.dataset.file)
+    var path = el.dataset.file;
+    if (el.dataset.agent) path = el.dataset.agent + '/' + path;
+    fetch('/__inspect__/api/' + path)
       .then(r => r.json())
       .then(data => {
         el.querySelector('.rendered pre').textContent = data.markdown || '(empty)';
