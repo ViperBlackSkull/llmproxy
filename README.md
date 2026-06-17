@@ -98,12 +98,29 @@ go run . # listens on :8765, forwards to api.anthropic.com
 
 Then point any tool at `http://localhost:8765`.
 
+## Security Notice
+
+llmproxy is a **local development tool** for inspecting your own LLM API traffic. It is designed to run on `localhost` only.
+
+- The MITM/TLS interception features (`lib/intercept.c`, `lib/redirect.c`, `examples/grab.py`) are intended for **authorized testing and research** on your own machines.
+- The inspect dashboard binds to localhost and has no authentication — do not expose it to a network.
+- API keys are read from environment variables, never hardcoded. Keep your `.env` files out of version control (they're in `.gitignore`).
+- Do not use this tool to intercept traffic you are not authorized to intercept.
+
 ## Configuration
 
-All config via environment variables:
+All config via environment variables. Copy `.env.example` to `.env` and fill in your keys:
+
+```bash
+cp .env.example .env
+# Edit .env with your actual API keys
+```
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `ANTHROPIC_API_KEY` | — | Your Anthropic API key |
+| `OPENAI_API_KEY` | — | Your OpenAI API key |
+| `GEMINI_API_KEY` | — | Your Google Gemini API key |
 | `BACKEND_URL` | Auto-detected per agent | Upstream API to forward to |
 | `PROXY_PORT` | First available from 8765-8770 | Proxy listen port |
 | `LOG_DIR` | `./logs` | Directory for captured logs |
