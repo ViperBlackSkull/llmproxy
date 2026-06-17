@@ -1,7 +1,6 @@
 # Binaries (build with: make build)
 llmproxyd
 llmproxy_bin
-llmproxy
 *.exe
 *.test
 *.out

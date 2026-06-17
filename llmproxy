@@ -1,0 +1,358 @@
+#!/bin/bash
+
+# llmproxy - Transparent LLM API proxy wrapper (proxychains-style)
+# Starts a logging proxy, points the agent at it, runs the command, then cleans up.
+# The proxy is transparent — it forwards to the original API endpoints automatically.
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/logs}"
+
+# Track all patched files for cleanup: "dest=backup" pairs
+PATCHED_FILES=()
+# Track temp dirs to clean up
+PATCHED_DIRS=()
+
+# --- Subcommands ---
+
+cmd_logs() {
+    shift
+    mkdir -p "$LOG_DIR"
+    if [[ $# -gt 0 && "$1" == "open" ]]; then
+        PORT="${2:-8777}"
+        echo "Inspect dashboard: http://localhost:$PORT/__inspect__" >&2
+        echo "Press Ctrl+C to stop" >&2
+        LOG_DIR="$LOG_DIR" LISTEN_ADDR=":$PORT" "$SCRIPT_DIR/llmproxyd" -q
+        exit $?
+    fi
+    if ls "$LOG_DIR"/*.md &>/dev/null; then
+        for f in "$LOG_DIR"/*.md; do
+            basename "$f"
+        done | sort -r
+    else
+        echo "No logs found in $LOG_DIR"
+    fi
+    exit 0
+}
+
+cmd_inspect() {
+    shift
+    mkdir -p "$LOG_DIR"
+    PORT="${1:-8777}"
+    echo "Inspect dashboard: http://localhost:$PORT/__inspect__" >&2
+    echo "Press Ctrl+C to stop" >&2
+    LOG_DIR="$LOG_DIR" LISTEN_ADDR=":$PORT" "$SCRIPT_DIR/llmproxyd" -q
+    exit $?
+}
+
+cmd_help() {
+    cat <<EOF
+Usage: llmproxy <command> [args...]
+
+Transparent LLM API proxy. Wraps any coding agent and captures all
+prompt traffic to markdown logs with a web dashboard.
+
+The proxy is transparent — no provider config needed. It reads the
+agent's own API keys and endpoints from the environment and forwards
+requests to the original destination.
+
+Supported agents (auto-detected):
+  claude            Claude Code (Anthropic)
+  pi                Pi Coding Agent (earendil-works)
+  opencode          OpenCode
+  codex             OpenAI Codex CLI
+  aider             Aider
+  gemini            Gemini CLI
+  *                 Any other command (sets all known base URL env vars)
+
+Commands:
+  logs              List captured logs
+  logs open         Open inspect dashboard on historical logs
+  inspect [port]    Open inspect dashboard (default: 8777)
+
+Examples:
+  llmproxy claude -p "hello"
+  llmproxy pi -p "hello"
+  llmproxy codex "fix the bug"
+  llmproxy aider --model gpt-4o "refactor auth"
+  llmproxy opencode
+  llmproxy gemini -p "explain this code"
+  llmproxy some-new-agent --flags  # any agent works
+
+Environment:
+  LOG_DIR           Directory for logs (default: ./logs)
+  PROXY_PORT        Force a specific proxy port
+  TRANSPARENT       Set to "false" to use hardcoded backend overrides
+EOF
+    exit 0
+}
+
+if [[ $# -eq 0 ]]; then
+    cmd_help
+fi
+
+case "${1:-}" in
+    logs)   cmd_logs "$@" ;;
+    inspect) cmd_inspect "$@" ;;
+    help|--help|-h) cmd_help ;;
+esac
+
+# --- Agent detection ---
+
+AGENT_CMD="$1"
+AGENT_TYPE="unknown"
+
+case "$(basename "$AGENT_CMD")" in
+    claude)         AGENT_TYPE="claude" ;;
+    pi)             AGENT_TYPE="pi" ;;
+    codex)          AGENT_TYPE="codex" ;;
+    aider)          AGENT_TYPE="aider" ;;
+    opencode)       AGENT_TYPE="opencode" ;;
+    gemini)         AGENT_TYPE="gemini" ;;
+    *)              AGENT_TYPE="generic" ;;
+esac
+
+# --- Find proxy daemon ---
+
+PROXYD="$SCRIPT_DIR/llmproxyd"
+if [[ ! -x "$PROXYD" ]]; then
+    echo "Error: Cannot find llmproxyd binary. Run 'make build' first." >&2
+    exit 1
+fi
+
+mkdir -p "$LOG_DIR"
+
+# --- Find available port ---
+
+PROXY_PORT="${PROXY_PORT:-}"
+if [[ -z "$PROXY_PORT" ]]; then
+    for port in 8765 8766 8767 8768 8769 8770; do
+        if ! ss -tlnH | grep -q ":${port} "; then
+            PROXY_PORT=$port
+            break
+        fi
+    done
+fi
+
+if [[ -z "$PROXY_PORT" ]]; then
+    echo "Error: No available port found. Set PROXY_PORT manually." >&2
+    exit 1
+fi
+
+PROXY_URL="http://localhost:$PROXY_PORT"
+
+# --- Helper: patch a JSON config file, backing up the original ---
+
+patch_json() {
+    local dest="$1"
+    shift
+    if [[ ! -f "$dest" ]]; then return; fi
+    if ! command -v jq &>/dev/null; then return; fi
+
+    local backup
+    backup=$(mktemp --suffix=.json)
+    cp "$dest" "$backup"
+    PATCHED_FILES+=("$dest=$backup")
+    jq "$@" "$backup" > "$dest"
+}
+
+# --- Determine active Pi profile ---
+
+pi_active_profile() {
+    local settings="$HOME/.pi/agent/settings.json"
+    if [[ -f "$settings" ]] && command -v jq &>/dev/null; then
+        local provider
+        provider=$(jq -r '.defaultProvider // "zai"' "$settings")
+        local profile
+        profile=$(jq -r --arg id "$provider" '.[] | select(.id == $id) | .profile // ""' "$HOME/.pi/agent/providers.json" 2>/dev/null)
+        if [[ -n "$profile" ]]; then
+            echo "$profile"
+            return
+        fi
+    fi
+    echo "zai-claude"
+}
+
+# --- Determine OpenCode provider base URL ---
+
+opencode_base_url() {
+    local config="$HOME/.config/opencode/opencode.json"
+    if [[ -f "$config" ]] && command -v jq &>/dev/null; then
+        jq -r '[.provider // {} | to_entries[] | .value.options.baseURL // empty] | first // ""' "$config" 2>/dev/null
+    fi
+}
+
+# --- Determine the real Anthropic backend Claude Code uses ---
+# Claude Code's settings.json .env.ANTHROPIC_BASE_URL overrides the shell env.
+# The wrapper redirects that to the proxy (see claude case below), so the daemon
+# must be told the real upstream via ANTHROPIC_BACKEND at startup — otherwise it
+# falls back to api.anthropic.com and the agent's own token (e.g. a z.ai token)
+# is rejected with 401 "Invalid bearer token".
+claude_real_base_url() {
+    local url=""
+    local settings="$HOME/.claude/settings.json"
+    if [[ -f "$settings" ]] && command -v jq &>/dev/null; then
+        url=$(jq -r '.env.ANTHROPIC_BASE_URL // empty' "$settings" 2>/dev/null)
+    fi
+    # Fall back to shell env if settings.json didn't define it
+    [[ -z "$url" ]] && url="${ANTHROPIC_BASE_URL:-}"
+    url="${url%/}"
+    # Ignore self-referential / stale-proxy URLs so we never forward to ourselves
+    if [[ "$url" =~ ^(https?://)?(localhost|127\.|0\.0\.0\.0|\[) ]]; then
+        echo ""
+        return
+    fi
+    echo "$url"
+}
+
+# --- Pre-daemon agent config ---
+# Some agents need special daemon env vars (MITM, backend URLs) set at startup.
+
+DAEMON_ENV=(
+    AGENT_TYPE="$AGENT_TYPE"
+    LISTEN_ADDR=":$PROXY_PORT"
+    LOG_DIR="$LOG_DIR"
+)
+
+case "$AGENT_TYPE" in
+    claude)
+        # Claude Code sends to ANTHROPIC_BASE_URL. We redirect that to the proxy
+        # below, so tell the daemon the real upstream (ANTHROPIC_BACKEND) — without
+        # it the daemon falls back to api.anthropic.com and rejects a non-Anthropic
+        # token (e.g. z.ai) with 401 "Invalid bearer token".
+        REAL_ANTHROPIC=$(claude_real_base_url)
+        if [[ -n "$REAL_ANTHROPIC" ]]; then
+            DAEMON_ENV+=(ANTHROPIC_BACKEND="$REAL_ANTHROPIC")
+        fi
+        ;;
+    codex|pi)
+        # Codex (MUSL binary) and Pi (Docker-owned settings) can't be redirected via
+        # env vars. Use MITM (HTTPS_PROXY + CA cert injection) for interception.
+        DAEMON_ENV+=(MITM_ENABLED=true)
+        ;;
+    opencode)
+        # OpenCode uses per-provider baseURL in its config, not env vars.
+        # The daemon needs to know the real backend URL at startup.
+        OC_REAL_URL=$(opencode_base_url)
+        if [[ -n "$OC_REAL_URL" ]]; then
+            DAEMON_ENV+=(OPENAI_BACKEND="$OC_REAL_URL")
+        fi
+        ;;
+    pi)
+        # Pi uses HTTPS_PROXY + MITM, no special daemon config needed.
+        ;;
+esac
+
+env "${DAEMON_ENV[@]}" "$PROXYD" -q &
+PROXY_PID=$!
+
+sleep 0.3
+
+if ! kill -0 $PROXY_PID 2>/dev/null; then
+    echo "Error: Proxy failed to start" >&2
+    exit 1
+fi
+
+# --- Configure agent to use proxy ---
+
+case "$AGENT_TYPE" in
+    claude)
+        # Claude Code's settings.json env overrides shell env vars.
+        # Patch settings.json to point ANTHROPIC_BASE_URL at the proxy.
+        patch_json "$HOME/.claude/settings.json" --arg url "$PROXY_URL" '.env.ANTHROPIC_BASE_URL = $url'
+        export ANTHROPIC_BASE_URL="$PROXY_URL"
+        ;;
+    pi)
+        # Pi reads ANTHROPIC_BASE_URL from profile settings.json (Docker-owned, not writable).
+        # Use MITM (HTTPS_PROXY + CA cert) for interception.
+        # Pi is Node.js — use NODE_EXTRA_CA_CERTS (not SSL_CERT_FILE).
+        export HTTPS_PROXY="$PROXY_URL"
+        export HTTP_PROXY="$PROXY_URL"
+        export NODE_EXTRA_CA_CERTS="$HOME/.llmproxy/ca.crt"
+        export ANTHROPIC_BASE_URL="$PROXY_URL"
+        export OPENAI_BASE_URL="$PROXY_URL"
+        ;;
+    codex)
+        # Codex is a MUSL binary — ignores *_BASE_URL. Use HTTPS_PROXY + MITM.
+        export HTTPS_PROXY="$PROXY_URL"
+        export HTTP_PROXY="$PROXY_URL"
+        export SSL_CERT_FILE="$HOME/.llmproxy/ca.crt"
+        export OPENAI_BASE_URL="$PROXY_URL"
+        ;;
+    aider)
+        export OPENAI_API_BASE="$PROXY_URL"
+        export ANTHROPIC_API_BASE="$PROXY_URL"
+        ;;
+    opencode)
+        # OpenCode uses per-provider baseURL in its config file, not env vars.
+        # Patch the config to point at the proxy.
+        OC_CONFIG="$HOME/.config/opencode/opencode.json"
+        patch_json "$OC_CONFIG" --arg url "$PROXY_URL" '
+            .provider |= (
+                if . then
+                    to_entries | map(
+                        .value.options.baseURL = $url
+                    ) | from_entries
+                else . end
+            )
+        '
+        export OPENAI_BASE_URL="$PROXY_URL"
+        export ANTHROPIC_BASE_URL="$PROXY_URL"
+        ;;
+    gemini)
+        export GOOGLE_GEMINI_BASE_URL="$PROXY_URL"
+        ;;
+    *)
+        # Generic — set everything, the agent reads what it needs
+        export ANTHROPIC_BASE_URL="$PROXY_URL"
+        export OPENAI_BASE_URL="$PROXY_URL"
+        export OPENAI_API_BASE="$PROXY_URL"
+        export ANTHROPIC_API_BASE="$PROXY_URL"
+        export GOOGLE_GEMINI_BASE_URL="$PROXY_URL"
+        ;;
+esac
+
+# --- Cleanup ---
+
+cleanup() {
+    # Restore all patched config files
+    for entry in "${PATCHED_FILES[@]}"; do
+        local dest="${entry%%=*}"
+        local backup="${entry#*=}"
+        if [[ -f "$backup" ]]; then
+            mv "$backup" "$dest"
+        fi
+    done
+
+    # Clean up temp dirs
+    for d in "${PATCHED_DIRS[@]}"; do
+        rm -rf "$d" 2>/dev/null || true
+    done
+
+    kill $PROXY_PID 2>/dev/null || true
+    wait $PROXY_PID 2>/dev/null || true
+
+    local count=0
+    if [[ -d "$LOG_DIR/$AGENT_TYPE" ]]; then
+        for f in "$LOG_DIR/$AGENT_TYPE"/*.md; do
+            if [[ -f "$f" ]]; then
+                count=$((count + 1))
+            fi
+        done
+    fi
+    if [[ $count -gt 0 ]]; then
+        echo "" >&2
+        echo "[llmproxy] $AGENT_TYPE: captured $count request(s). Inspect: llmproxy inspect" >&2
+    fi
+}
+trap cleanup EXIT
+
+# --- Run the command ---
+
+echo "[llmproxy] agent=$AGENT_TYPE proxy=:$PROXY_PORT" >&2
+
+"$@"
+EXIT_CODE=$?
+
+exit $EXIT_CODE
