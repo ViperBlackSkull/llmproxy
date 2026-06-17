@@ -1,0 +1,352 @@
+package main
+
+import (
+	"encoding/json"
+	"testing"
+)
+
+// --- detectAPIType ---
+
+func TestDetectAPIType(t *testing.T) {
+	tests := []struct {
+		path string
+		want string
+	}{
+		{"/v1/messages", "anthropic"},
+		{"/v1/chat/completions", "openai"},
+		{"/v1/responses", "openai"},
+		{"/v1beta/models/gemini-2.0-flash:generateContent", "gemini"},
+		{"/v1beta/models/gemini-2.0-flash:streamGenerateContent", "gemini"},
+		{"/v1/embeddings", "unknown"},
+		{"/something/else", "unknown"},
+	}
+	for _, tt := range tests {
+		got := detectAPIType(tt.path, nil)
+		if got != tt.want {
+			t.Errorf("detectAPIType(%q) = %q, want %q", tt.path, got, tt.want)
+		}
+	}
+}
+
+// --- extractModel ---
+
+func TestExtractModel(t *testing.T) {
+	// Anthropic / OpenAI: model in body
+	body := []byte(`{"model":"claude-sonnet-4-20250514","messages":[]}`)
+	got := extractModel(body, "/v1/messages")
+	if got != "claude-sonnet-4-20250514" {
+		t.Errorf("extractModel anthropic = %q, want claude-sonnet-4-20250514", got)
+	}
+
+	// Gemini: model in URL path
+	got = extractModel(nil, "/v1beta/models/gemini-2.0-flash:generateContent")
+	if got != "gemini-2.0-flash" {
+		t.Errorf("extractModel gemini = %q, want gemini-2.0-flash", got)
+	}
+
+	// Gemini streaming
+	got = extractModel(nil, "/v1beta/models/gemini-2.5-pro:streamGenerateContent")
+	if got != "gemini-2.5-pro" {
+		t.Errorf("extractModel gemini-stream = %q, want gemini-2.5-pro", got)
+	}
+
+	// Empty
+	got = extractModel([]byte(`{}`), "/v1/something")
+	if got != "" {
+		t.Errorf("extractModel empty = %q, want empty", got)
+	}
+}
+
+// --- extractSystemPrompt ---
+
+func TestExtractSystemPromptAnthropic(t *testing.T) {
+	// String system
+	body := []byte(`{"model":"claude-sonnet-4-20250514","system":"You are helpful","messages":[]}`)
+	got := extractSystemPrompt(body)
+	if got != "You are helpful" {
+		t.Errorf("anthropic string system = %q", got)
+	}
+
+	// Content block array
+	body = []byte(`{"system":[{"type":"text","text":"Part 1"},{"type":"text","text":"Part 2"}]}`)
+	got = extractSystemPrompt(body)
+	if got != "Part 1\nPart 2" {
+		t.Errorf("anthropic blocks system = %q", got)
+	}
+}
+
+func TestExtractSystemPromptOpenAIChat(t *testing.T) {
+	body := []byte(`{"model":"gpt-5","messages":[{"role":"system","content":"Be concise"},{"role":"user","content":"hi"}]}`)
+	got := extractSystemPrompt(body)
+	if got != "Be concise" {
+		t.Errorf("openai chat system = %q", got)
+	}
+
+	// Array content
+	body = []byte(`{"messages":[{"role":"system","content":[{"type":"text","text":"Multi"},{"type":"text","text":"Part"}]}]}`)
+	got = extractSystemPrompt(body)
+	if got != "Multi\nPart" {
+		t.Errorf("openai chat array system = %q", got)
+	}
+}
+
+func TestExtractSystemPromptResponsesAPI(t *testing.T) {
+	// Top-level instructions
+	body := []byte(`{"model":"gpt-5","instructions":"Talk like a pirate","input":"hello"}`)
+	got := extractSystemPrompt(body)
+	if got != "Talk like a pirate" {
+		t.Errorf("responses instructions = %q", got)
+	}
+
+	// Developer role in input array
+	body = []byte(`{"model":"gpt-5","input":[{"role":"developer","content":"Be helpful"},{"role":"user","content":"hi"}]}`)
+	got = extractSystemPrompt(body)
+	if got != "Be helpful" {
+		t.Errorf("responses developer role = %q", got)
+	}
+
+	// Developer role with array content
+	body = []byte(`{"model":"gpt-5","input":[{"role":"developer","content":[{"type":"input_text","text":"Be"},{"type":"input_text","text":"helpful"}]}]}`)
+	got = extractSystemPrompt(body)
+	if got != "Be\nhelpful" {
+		t.Errorf("responses developer array = %q", got)
+	}
+}
+
+func TestExtractSystemPromptGemini(t *testing.T) {
+	body := []byte(`{"contents":[],"systemInstruction":{"parts":[{"text":"You are a helpful assistant"}]}}`)
+	got := extractSystemPrompt(body)
+	if got != "You are a helpful assistant" {
+		t.Errorf("gemini systemInstruction = %q", got)
+	}
+
+	// Multi-part
+	body = []byte(`{"systemInstruction":{"parts":[{"text":"Part 1"},{"text":"Part 2"}]}}`)
+	got = extractSystemPrompt(body)
+	if got != "Part 1\nPart 2" {
+		t.Errorf("gemini systemInstruction multi = %q", got)
+	}
+}
+
+func TestExtractSystemPromptCodex(t *testing.T) {
+	body := []byte(`{"instructions":"Codex system prompt","model":"gpt-5"}`)
+	got := extractSystemPrompt(body)
+	if got != "Codex system prompt" {
+		t.Errorf("codex instructions = %q", got)
+	}
+}
+
+// --- extractMessages ---
+
+func TestExtractMessagesOpenAIChat(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"system","content":"sys"},{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}]}`)
+	msgs := extractMessages(body, "openai")
+	if len(msgs) != 2 {
+		t.Fatalf("openai chat msgs = %d, want 2", len(msgs))
+	}
+	if msgs[0] != "**user**: hello" {
+		t.Errorf("openai msg[0] = %q", msgs[0])
+	}
+	if msgs[1] != "**assistant**: hi" {
+		t.Errorf("openai msg[1] = %q", msgs[1])
+	}
+}
+
+func TestExtractMessagesResponsesAPI(t *testing.T) {
+	// input as array
+	body := []byte(`{"input":[{"role":"developer","content":"sys"},{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}]}`)
+	msgs := extractMessages(body, "openai")
+	if len(msgs) != 2 {
+		t.Fatalf("responses array msgs = %d, want 2", len(msgs))
+	}
+	if msgs[0] != "**user**: hello" {
+		t.Errorf("responses msg[0] = %q", msgs[0])
+	}
+
+	// input as string
+	body = []byte(`{"input":"just a string","model":"gpt-5"}`)
+	msgs = extractMessages(body, "openai")
+	if len(msgs) != 1 || msgs[0] != "**user**: just a string" {
+		t.Errorf("responses string input = %v", msgs)
+	}
+}
+
+func TestExtractMessagesGemini(t *testing.T) {
+	body := []byte(`{"contents":[{"role":"user","parts":[{"text":"hello"}]},{"role":"model","parts":[{"text":"hi there"}]}]}`)
+	msgs := extractMessages(body, "gemini")
+	if len(msgs) != 2 {
+		t.Fatalf("gemini msgs = %d, want 2", len(msgs))
+	}
+	if msgs[0] != "**user**: hello" {
+		t.Errorf("gemini msg[0] = %q", msgs[0])
+	}
+	if msgs[1] != "**assistant**: hi there" {
+		t.Errorf("gemini msg[1] = %q", msgs[1])
+	}
+}
+
+// --- extractStreamedText ---
+
+func TestExtractStreamedTextAnthropic(t *testing.T) {
+	data := []byte("data: " + marshal(map[string]interface{}{
+		"type":  "content_block_delta",
+		"delta": map[string]string{"text": "Hello"},
+	}) + "\n" +
+		"data: " + marshal(map[string]interface{}{
+			"type":  "content_block_delta",
+			"delta": map[string]string{"text": " world"},
+		}) + "\n")
+	got := extractStreamedText(data, "anthropic")
+	if got != "Hello world" {
+		t.Errorf("anthropic stream = %q", got)
+	}
+}
+
+func TestExtractStreamedTextOpenAIChat(t *testing.T) {
+	data := []byte("data: " + marshal(map[string]interface{}{
+		"choices": []map[string]interface{}{
+			{"delta": map[string]string{"content": "Hi"}},
+		},
+	}) + "\n" +
+		"data: " + marshal(map[string]interface{}{
+			"choices": []map[string]interface{}{
+				{"delta": map[string]string{"content": " there"}},
+			},
+		}) + "\n" +
+		"data: [DONE]\n")
+	got := extractStreamedText(data, "openai")
+	if got != "Hi there" {
+		t.Errorf("openai chat stream = %q", got)
+	}
+}
+
+func TestExtractStreamedTextResponsesAPI(t *testing.T) {
+	data := []byte("data: " + marshal(map[string]interface{}{
+		"type":  "response.output_text.delta",
+		"delta": "Hello",
+	}) + "\n" +
+		"data: " + marshal(map[string]interface{}{
+			"type":  "response.output_text.delta",
+			"delta": " from Responses",
+		}) + "\n" +
+		"data: " + marshal(map[string]interface{}{
+			"type": "response.output_text.done",
+		}) + "\n")
+	got := extractStreamedText(data, "openai")
+	if got != "Hello from Responses" {
+		t.Errorf("responses stream = %q", got)
+	}
+}
+
+func TestExtractStreamedTextGemini(t *testing.T) {
+	data := []byte(`[{"candidates":[{"content":{"parts":[{"text":"Hello"}],"role":"model"}}]},{"candidates":[{"content":{"parts":[{"text":" world"}],"role":"model"}}]}]`)
+	got := extractStreamedText(data, "gemini")
+	if got != "Hello world" {
+		t.Errorf("gemini stream = %q", got)
+	}
+}
+
+// --- modifySystemInBody ---
+
+func TestModifySystemInBodyAnthropic(t *testing.T) {
+	body := []byte(`{"model":"claude-sonnet-4-20250514","system":"old system","messages":[]}`)
+	modified, err := modifySystemInBody(body, "new system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]interface{}
+	json.Unmarshal(modified, &m)
+	if m["system"] != "new system" {
+		t.Errorf("anthropic modify = %v", m["system"])
+	}
+}
+
+func TestModifySystemInBodyOpenAIChat(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"system","content":"old"},{"role":"user","content":"hi"}]}`)
+	modified, err := modifySystemInBody(body, "new system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	json.Unmarshal(modified, &m)
+	for _, msg := range m.Messages {
+		if msg.Role == "system" && msg.Content != "new system" {
+			t.Errorf("openai modify = %q", msg.Content)
+		}
+	}
+}
+
+func TestModifySystemInBodyResponsesAPI(t *testing.T) {
+	// Instructions field
+	body := []byte(`{"model":"gpt-5","instructions":"old","input":"hello"}`)
+	modified, err := modifySystemInBody(body, "new instructions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]interface{}
+	json.Unmarshal(modified, &m)
+	if m["instructions"] != "new instructions" {
+		t.Errorf("responses instructions modify = %v", m["instructions"])
+	}
+
+	// Developer role in input array
+	body = []byte(`{"model":"gpt-5","input":[{"role":"developer","content":"old"},{"role":"user","content":"hi"}]}`)
+	modified, err = modifySystemInBody(body, "new developer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	json.Unmarshal(modified, &m)
+	input := m["input"].([]interface{})
+	devMsg := input[0].(map[string]interface{})
+	if devMsg["content"] != "new developer" {
+		t.Errorf("responses developer modify = %v", devMsg["content"])
+	}
+}
+
+func TestModifySystemInBodyGemini(t *testing.T) {
+	body := []byte(`{"contents":[],"systemInstruction":{"parts":[{"text":"old"}]}}`)
+	modified, err := modifySystemInBody(body, "new system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]interface{}
+	json.Unmarshal(modified, &m)
+	si := m["systemInstruction"].(map[string]interface{})
+	parts := si["parts"].([]interface{})
+	part := parts[0].(map[string]interface{})
+	if part["text"] != "new system" {
+		t.Errorf("gemini modify = %v", part["text"])
+	}
+}
+
+// --- isStreamingRequest ---
+
+func TestIsStreamingRequest(t *testing.T) {
+	// Body stream flag
+	if !isStreamingRequest([]byte(`{"stream":true}`), "/v1/messages") {
+		t.Error("stream:true should be streaming")
+	}
+	if isStreamingRequest([]byte(`{"stream":false}`), "/v1/messages") {
+		t.Error("stream:false should not be streaming")
+	}
+
+	// Gemini path-based detection
+	if !isStreamingRequest(nil, "/v1beta/models/gemini-2.0-flash:streamGenerateContent") {
+		t.Error("Gemini streamGenerateContent should be streaming")
+	}
+	if isStreamingRequest(nil, "/v1beta/models/gemini-2.0-flash:generateContent") {
+		t.Error("Gemini generateContent should not be streaming")
+	}
+}
+
+// helper
+
+func marshal(v interface{}) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}
