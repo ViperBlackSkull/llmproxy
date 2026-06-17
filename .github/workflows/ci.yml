@@ -24,7 +24,9 @@ jobs:
         run: go test ./...
 
       - name: Build project
-        run: go build ./...
+        # Build to /dev/null: the repo dir is named `llmproxy`, so a bare
+        # `go build ./...` would collide with the tracked `llmproxy` launcher.
+        run: go build -o /dev/null .
 
       - name: Run make build
         run: make build
