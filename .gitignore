@@ -5,6 +5,9 @@ llmproxy_bin
 *.test
 *.out
 
+# GoReleaser build output
+dist/
+
 # Logs
 logs/
 

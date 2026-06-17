@@ -1,0 +1,62 @@
+name: Feature Request
+description: Suggest a new feature or enhancement
+labels: [enhancement]
+assignees: []
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem this solves
+      description: What problem or limitation does this feature address?
+      placeholder: Describe the current gap or pain point
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-solution
+    attributes:
+      label: Proposed solution
+      description: Clearly describe the feature you'd like to see implemented
+      placeholder: Detailed description of the desired functionality
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Have you considered any alternative solutions or workarounds?
+      placeholder: Describe any alternative approaches you've thought of or tried
+    validations:
+      required: false
+
+  - type: textarea
+    id: use-cases
+    attributes:
+      label: Use cases
+      description: Provide specific examples of how this feature would be used
+      placeholder: |
+        - When I do X, I need Y to happen
+        - This would enable Z workflow
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: willingness
+    attributes:
+      label: Are you willing to contribute this feature?
+      description: We welcome contributions! Check if you'd like to submit a PR.
+      options:
+        - label: Yes, I'd like to submit a PR for this feature
+          required: false
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Any other relevant information, references, or mockups
+      placeholder: Links to related issues, documentation, mockups, etc.
+    validations:
+      required: false
