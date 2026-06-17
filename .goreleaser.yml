@@ -1,0 +1,27 @@
+version: 2
+
+builds:
+  - id: llmproxyd
+    main: .
+    binary: llmproxyd
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+    ldflags:
+      - -s -w
+
+archives:
+  - name_template: "llmproxy_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - llmproxy
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: "{{ .ProjectName }}_{{ .Version }}_checksums.txt"
+
+changelog:
+  use: git

@@ -42,11 +42,27 @@ Works across all supported agents and API formats:
 
 Requirements: [Go](https://go.dev/) 1.22+, `jq` (for Claude Code only)
 
+### Option 1 — Prebuilt binary (Linux x86_64)
+
+Download the latest release from the [Releases](https://github.com/ViperBlackSkull/llmproxy/releases) page:
+
+```bash
+wget https://github.com/ViperBlackSkull/llmproxy/releases/latest/download/llmproxy_*_linux_amd64.tar.gz
+tar -xzf llmproxy_*_linux_amd64.tar.gz
+./llmproxy claude -p "hello"
+```
+
+Or add the extracted directory to your `PATH` to run `llmproxy` from anywhere.
+
+### Option 2 — Build from source
+
 ```bash
 git clone https://github.com/ViperBlackSkull/llmproxy.git
 cd llmproxy
 make build
 ```
+
+Requires Go 1.22+. The optional MITM libs in `lib/` also require gcc.
 
 ## Usage
 
