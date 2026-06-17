@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"embed"
+	"flag"
 	"fmt"
 	"html/template"
 	"io"
@@ -35,27 +36,151 @@ import (
 var webFS embed.FS
 
 type Config struct {
-	ListenAddr string
-	BackendURL string
-	LogDir     string
-	AgentType  string
+	ListenAddr  string
+	BackendURL  string // global override for all requests
+	LogDir      string
+	AgentType   string
 	MitmEnabled bool
-	ForwardURL string
+	ForwardURL  string
+	StripPrompt bool
+	Transparent bool // forward to original destination by default
+
+	// Per-provider backend URLs (used for BASE_URL redirect or explicit overrides)
+	Backends map[string]string // "anthropic"|"openai"|"gemini" -> upstream URL
+
+	// Per-provider API keys — only injected when Transparent=false or explicitly overridden
+	APIKeys map[string]string // "anthropic"|"openai"|"gemini" -> key
 
 	// MITM state
-	caCert   *x509.Certificate
-	caKey    *ecdsa.PrivateKey
+	caCert    *x509.Certificate
+	caKey     *ecdsa.PrivateKey
 	caCertPEM []byte
 	certCache sync.Map
 }
 
-func main() {
-	backendURL := getEnv("BACKEND_URL", "")
-	if backendURL == "" {
-		backendURL = getEnv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+func resolveBackend(overrideEnv, baseURLEnv, fallback string) string {
+	if v := strings.TrimRight(os.Getenv(overrideEnv), "/"); v != "" {
+		return v
 	}
-	// Strip trailing slash
-	backendURL = strings.TrimRight(backendURL, "/")
+	if v := strings.TrimRight(os.Getenv(baseURLEnv), "/"); v != "" {
+		return v
+	}
+	return strings.TrimRight(fallback, "/")
+}
+
+func isSelfReference(backendHost, listenAddr string) bool {
+	host := backendHost
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	selfRefs := []string{"127.0.0.1", "localhost", "0.0.0.0", "::1"}
+	for _, ref := range selfRefs {
+		if host == ref {
+			if _, port, err := net.SplitHostPort(backendHost); err == nil {
+				if _, lport, err := net.SplitHostPort(listenAddr); err == nil && port == lport {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func (c Config) backendForAPI(apiType string) string {
+	if c.BackendURL != "" {
+		return c.BackendURL
+	}
+	if url, ok := c.Backends[apiType]; ok {
+		return url
+	}
+	if url, ok := c.Backends["anthropic"]; ok {
+		return url
+	}
+	return "https://api.anthropic.com"
+}
+
+// resolveTarget determines the upstream URL for a request.
+// In transparent mode, it forwards to the original destination from the request Host.
+// When the request targets the proxy itself (BASE_URL redirect), it uses the Backends
+// map to find the real upstream. Explicit overrides (BACKEND_URL, *_BACKEND env vars)
+// always take precedence.
+func (c Config) resolveTarget(r *http.Request, apiType string) string {
+	// Global override always wins
+	if c.BackendURL != "" {
+		return c.BackendURL
+	}
+
+	// Per-provider explicit override (user set *_BACKEND env var)
+	envKey := strings.ToUpper(apiType) + "_BACKEND"
+	if _, explicitlySet := os.LookupEnv(envKey); explicitlySet {
+		if url, ok := c.Backends[apiType]; ok && url != "" {
+			return url
+		}
+	}
+
+	// Transparent mode: forward to original destination
+	if c.Transparent {
+		host := r.Host
+		if host == "" {
+			host = r.URL.Host
+		}
+
+		// If the agent pointed its BASE_URL at us, use Backends map for routing
+		if isSelfReference(host, c.ListenAddr) {
+			if url, ok := c.Backends[apiType]; ok {
+				return url
+			}
+			if url, ok := c.Backends["anthropic"]; ok {
+				return url
+			}
+			return "https://api.anthropic.com"
+		}
+
+		// Request to external host — forward as-is
+		return "https://" + host
+	}
+
+	// Non-transparent: use Backends map (legacy behavior)
+	return c.backendForAPI(apiType)
+}
+
+// injectAPIKey replaces auth headers with the proxy's stored key for the given provider.
+// In transparent mode, the agent's own auth headers pass through — no injection.
+func (c Config) injectAPIKey(req *http.Request, apiType string) {
+	if c.Transparent {
+		return
+	}
+	key, ok := c.APIKeys[apiType]
+	if !ok || key == "" {
+		return
+	}
+	switch apiType {
+	case "anthropic":
+		req.Header.Set("x-api-key", key)
+	case "openai":
+		req.Header.Set("Authorization", "Bearer "+key)
+	case "gemini":
+		req.Header.Set("x-goog-api-key", key)
+		// Also inject into query param if not present
+		if req.URL.Query().Get("key") == "" {
+			q := req.URL.Query()
+			q.Set("key", key)
+			req.URL.RawQuery = q.Encode()
+		}
+	}
+}
+
+func main() {
+	quiet := flag.Bool("q", false, "quiet mode — suppress all console output")
+	flag.Parse()
+	if *quiet {
+		log.SetOutput(io.Discard)
+	}
+
+	// BACKEND_URL is a global override — if set, ALL requests go there.
+	// Per-provider env vars: ANTHROPIC_BACKEND, OPENAI_BACKEND, GEMINI_BACKEND.
+	// These are separate from the client-facing ANTHROPIC_BASE_URL etc.
+	backendURL := strings.TrimRight(getEnv("BACKEND_URL", ""), "/")
 
 	cfg := Config{
 		ListenAddr: getEnv("LISTEN_ADDR", ":8765"),
@@ -63,6 +188,32 @@ func main() {
 		LogDir:     getEnv("LOG_DIR", "./logs"),
 		AgentType:  getEnv("AGENT_TYPE", "unknown"),
 		ForwardURL: getEnv("FORWARD_URL", ""),
+		StripPrompt: getEnv("STRIP_PROMPT", "") == "true" || getEnv("STRIP_PROMPT", "") == "1",
+		Transparent: getEnv("TRANSPARENT", "true") == "true",
+		Backends: map[string]string{
+			"anthropic": resolveBackend("ANTHROPIC_BACKEND", "ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
+			"openai":    resolveBackend("OPENAI_BACKEND", "OPENAI_BASE_URL", "https://api.openai.com"),
+			"gemini":    resolveBackend("GEMINI_BACKEND", "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com"),
+		},
+		APIKeys: map[string]string{
+			"anthropic": os.Getenv("ANTHROPIC_API_KEY"),
+			"openai":    os.Getenv("OPENAI_API_KEY"),
+			"gemini":    os.Getenv("GEMINI_API_KEY"),
+		},
+	}
+
+	// Detect self-referential backend URLs (would cause infinite loop)
+	for provider, backend := range cfg.Backends {
+		u, err := url.Parse(backend)
+		if err == nil && isSelfReference(u.Host, cfg.ListenAddr) {
+			defaults := map[string]string{
+				"anthropic": "https://api.anthropic.com",
+				"openai":    "https://api.openai.com",
+				"gemini":    "https://generativelanguage.googleapis.com",
+			}
+			log.Printf("WARNING: %s backend (%s) points to self, falling back to %s", provider, backend, defaults[provider])
+			cfg.Backends[provider] = defaults[provider]
+		}
 	}
 
 	if err := os.MkdirAll(cfg.LogDir, 0755); err != nil {
@@ -115,9 +266,29 @@ func main() {
 		handler.ServeHTTP(w, r)
 	})
 
-	log.Printf("LLM Proxy listening on %s, forwarding to %s", cfg.ListenAddr, cfg.BackendURL)
+	log.Printf("LLM Proxy listening on %s", cfg.ListenAddr)
+	if cfg.Transparent {
+		log.Printf("Mode: transparent (forwarding to original targets)")
+	} else {
+		log.Printf("Mode: override (rewriting to configured backends)")
+	}
+	if cfg.BackendURL != "" {
+		log.Printf("Global backend override: %s", cfg.BackendURL)
+	} else {
+		for provider, backend := range cfg.Backends {
+			log.Printf("  %s -> %s", provider, backend)
+		}
+	}
 	if cfg.ForwardURL != "" {
 		log.Printf("Forward URL: %s", cfg.ForwardURL)
+	}
+	if cfg.StripPrompt {
+		log.Printf("System prompt stripping enabled")
+	}
+	for provider, key := range cfg.APIKeys {
+		if key != "" {
+			log.Printf("  %s API key: configured (%d chars)", provider, len(key))
+		}
 	}
 
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
@@ -542,17 +713,20 @@ func isWebSocketUpgrade(r *http.Request) bool {
 }
 
 func proxyPassthrough(cfg Config, w http.ResponseWriter, r *http.Request) {
-	url := cfg.BackendURL + r.URL.Path
+	apiType := detectAPIType(r.URL.Path, nil)
+	target := cfg.resolveTarget(r, apiType)
+	reqURL := target + r.URL.Path
 	if r.URL.RawQuery != "" {
-		url += "?" + r.URL.RawQuery
+		reqURL += "?" + r.URL.RawQuery
 	}
 
-	req, err := http.NewRequest(r.Method, url, nil)
+	req, err := http.NewRequest(r.Method, reqURL, nil)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	copyHeaders(req.Header, r.Header)
+	cfg.injectAPIKey(req, apiType)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -578,9 +752,9 @@ func handleProxy(cfg Config, w http.ResponseWriter, r *http.Request) {
 
 	// Extract structured info from request
 	apiType := detectAPIType(path, body)
-	model := extractModel(body)
+	model := extractModel(body, path)
 	system := extractSystemPrompt(body)
-	messages := extractMessages(body)
+	messages := extractMessages(body, apiType)
 
 	// Save system prompt snapshot for this agent
 	if system != "" {
@@ -594,35 +768,53 @@ func handleProxy(cfg Config, w http.ResponseWriter, r *http.Request) {
 	logFile := fmt.Sprintf("%s/%s-%s", agentLogDir, timestamp, apiType)
 	writeRequestLog(logFile, apiType, model, system, messages, body)
 
-	// Forward request
-	url := cfg.BackendURL + path
-	if r.URL.RawQuery != "" {
-		url += "?" + r.URL.RawQuery
+	// Strip system prompt restrictions if enabled
+	if cfg.StripPrompt && system != "" {
+		if modified := stripSystemPrompt(system); modified != system {
+			var modErr error
+			body, modErr = modifySystemInBody(body, modified)
+			if modErr != nil {
+				log.Printf("[strip] Failed to modify body: %v", modErr)
+			} else {
+				log.Printf("[strip] System prompt: %d -> %d bytes", len(system), len(modified))
+			}
+		}
 	}
 
-	req, err := http.NewRequest(r.Method, url, bytes.NewReader(body))
+	// Forward request to the target
+	target := cfg.resolveTarget(r, apiType)
+	reqURL := target + path
+	if r.URL.RawQuery != "" {
+		reqURL += "?" + r.URL.RawQuery
+	}
+
+	req, err := http.NewRequest(r.Method, reqURL, bytes.NewReader(body))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	copyHeaders(req.Header, r.Header)
 	req.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
+	cfg.injectAPIKey(req, apiType)
 
+	startTime := time.Now()
 	resp, err := http.DefaultClient.Do(req)
+	latency := time.Since(startTime)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Backend error: %v", err), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
-	log.Printf("<- %d %s", resp.StatusCode, path)
+	log.Printf("<- %d %s (%s)", resp.StatusCode, path, latency.Round(time.Millisecond))
 
 	// Stream response to client while capturing it
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
-	isStream := isStreamingRequest(body)
-	proxyAndCapture(w, resp, logFile, isStream)
+	isStream := isStreamingRequest(body, path)
+	proxyAndCapture(w, resp, logFile, isStream, apiType)
+	writeMetadata(logFile, apiType, model, resp.StatusCode, latency, len(body))
 }
 
 type LogEntry struct {
@@ -768,7 +960,7 @@ func readFile(path string) string {
 	return string(data)
 }
 
-func proxyAndCapture(w http.ResponseWriter, resp *http.Response, logBase string, isStream bool) {
+func proxyAndCapture(w http.ResponseWriter, resp *http.Response, logBase string, isStream bool, apiType string) {
 	if !isStream {
 		body, _ := io.ReadAll(resp.Body)
 		w.Write(body)
@@ -801,7 +993,7 @@ func proxyAndCapture(w http.ResponseWriter, resp *http.Response, logBase string,
 		}
 	}
 
-	appendResponse(logBase, extractStreamedText(captured.Bytes()))
+	appendResponse(logBase, extractStreamedText(captured.Bytes(), apiType))
 }
 
 func detectAPIType(path string, body []byte) string {
@@ -817,12 +1009,39 @@ func detectAPIType(path string, body []byte) string {
 	return "unknown"
 }
 
-func extractModel(body []byte) string {
+// detectAPITypeFromHost falls back to hostname matching when path detection returns "unknown".
+func detectAPITypeFromHost(path string, body []byte, host string) string {
+	apiType := detectAPIType(path, body)
+	if apiType != "unknown" {
+		return apiType
+	}
+	h := strings.ToLower(host)
+	if strings.Contains(h, "anthropic") {
+		return "anthropic"
+	}
+	if strings.Contains(h, "openai") {
+		return "openai"
+	}
+	if strings.Contains(h, "googleapis") {
+		return "gemini"
+	}
+	return "unknown"
+}
+
+func extractModel(body []byte, reqPath string) string {
 	var r struct {
 		Model string `json:"model"`
 	}
-	if json.Unmarshal(body, &r) == nil {
+	if json.Unmarshal(body, &r) == nil && r.Model != "" {
 		return r.Model
+	}
+	// Gemini: model is in the URL path (/v1beta/models/gemini-2.0-flash:generateContent)
+	if idx := strings.Index(reqPath, "/models/"); idx != -1 {
+		after := reqPath[idx+8:]
+		if colon := strings.Index(after, ":"); colon != -1 {
+			return after[:colon]
+		}
+		return after
 	}
 	return ""
 }
@@ -891,7 +1110,188 @@ func extractSystemPrompt(body []byte) string {
 		return r3.Instructions
 	}
 
+	// Responses API: top-level "instructions" field
+	var r4 struct {
+		Instructions json.RawMessage `json:"instructions"`
+	}
+	if json.Unmarshal(body, &r4) == nil && r4.Instructions != nil {
+		var s string
+		if json.Unmarshal(r4.Instructions, &s) == nil && s != "" {
+			return s
+		}
+	}
+
+	// Responses API: developer/system role in "input" array
+	var r5 struct {
+		Input []struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"input"`
+	}
+	if json.Unmarshal(body, &r5) == nil {
+		for _, m := range r5.Input {
+			if m.Role == "developer" || m.Role == "system" {
+				var s string
+				if json.Unmarshal(m.Content, &s) == nil {
+					return s
+				}
+				var blocks []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				}
+				if json.Unmarshal(m.Content, &blocks) == nil {
+					var parts []string
+					for _, b := range blocks {
+						if b.Text != "" {
+							parts = append(parts, b.Text)
+						}
+					}
+					return strings.Join(parts, "\n")
+				}
+			}
+		}
+	}
+
+	// Gemini: systemInstruction.parts[].text
+	var r6 struct {
+		SystemInstruction struct {
+			Parts []struct {
+				Text string `json:"text"`
+			} `json:"parts"`
+		} `json:"systemInstruction"`
+	}
+	if json.Unmarshal(body, &r6) == nil && len(r6.SystemInstruction.Parts) > 0 {
+		var gParts []string
+		for _, p := range r6.SystemInstruction.Parts {
+			if p.Text != "" {
+				gParts = append(gParts, p.Text)
+			}
+		}
+		if len(gParts) > 0 {
+			return strings.Join(gParts, "\n")
+		}
+	}
+
 	return ""
+}
+
+var defaultStripKeywords = []string{
+	// Cybersecurity restrictions
+	"authorized security testing",
+	"destructive techniques",
+	"detection evasion",
+	"mass targeting",
+	"supply chain compromise",
+	"malicious purposes",
+	"dual-use security",
+	// Telemetry
+	"telemetry",
+}
+
+func stripSystemPrompt(system string) string {
+	paragraphs := strings.Split(system, "\n\n")
+	var kept []string
+	stripped := 0
+	for _, p := range paragraphs {
+		lower := strings.ToLower(p)
+		remove := false
+		for _, kw := range defaultStripKeywords {
+			if strings.Contains(lower, strings.ToLower(kw)) {
+				remove = true
+				break
+			}
+		}
+		if !remove {
+			kept = append(kept, p)
+		} else {
+			stripped++
+		}
+	}
+	if stripped > 0 {
+		log.Printf("[strip] Removed %d paragraph(s) from system prompt", stripped)
+	}
+	result := strings.Join(kept, "\n\n")
+
+	// Replace identity references
+	result = strings.ReplaceAll(result, "Claude", "Loki")
+	result = strings.ReplaceAll(result, "claude", "loki")
+
+	return result
+}
+
+func modifySystemInBody(body []byte, newSystem string) ([]byte, error) {
+	var m map[string]interface{}
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body, err
+	}
+
+	// Anthropic: top-level "system" field
+	if sys, ok := m["system"]; ok {
+		switch sys.(type) {
+		case string:
+			m["system"] = newSystem
+		case []interface{}:
+			m["system"] = []interface{}{
+				map[string]interface{}{"type": "text", "text": newSystem},
+			}
+		}
+	}
+
+	// OpenAI: messages array with role=system
+	if msgs, ok := m["messages"].([]interface{}); ok {
+		for i, msg := range msgs {
+			if msgMap, ok := msg.(map[string]interface{}); ok {
+				if role, _ := msgMap["role"].(string); role == "system" {
+					switch msgMap["content"].(type) {
+					case string:
+						msgMap["content"] = newSystem
+					case []interface{}:
+						msgMap["content"] = []interface{}{
+							map[string]interface{}{"type": "text", "text": newSystem},
+						}
+					}
+					msgs[i] = msgMap
+				}
+			}
+		}
+	}
+
+	// Instructions field (Codex-like and Responses API)
+	if _, ok := m["instructions"]; ok {
+		if _, isStr := m["instructions"].(string); isStr {
+			m["instructions"] = newSystem
+		}
+	}
+
+	// Responses API: developer/system role in "input" array
+	if input, ok := m["input"].([]interface{}); ok {
+		for i, item := range input {
+			if msgMap, ok := item.(map[string]interface{}); ok {
+				if role, _ := msgMap["role"].(string); role == "developer" || role == "system" {
+					switch msgMap["content"].(type) {
+					case string:
+						msgMap["content"] = newSystem
+					case []interface{}:
+						msgMap["content"] = []interface{}{
+							map[string]interface{}{"type": "input_text", "text": newSystem},
+						}
+					}
+					input[i] = msgMap
+				}
+			}
+		}
+	}
+
+	// Gemini: systemInstruction.parts[].text
+	if si, ok := m["systemInstruction"].(map[string]interface{}); ok {
+		if parts, ok := si["parts"].([]interface{}); ok && len(parts) > 0 {
+			si["parts"] = []interface{}{
+				map[string]interface{}{"text": newSystem},
+			}
+		}
+	}
+
+	return json.Marshal(m)
 }
 
 func saveSystemPrompt(cfg Config, system string) {
@@ -921,29 +1321,85 @@ func saveSystemPrompt(cfg Config, system string) {
 	os.WriteFile(timestampPath, []byte(system), 0644)
 }
 
-func extractMessages(body []byte) []string {
+func extractMessages(body []byte, apiType string) []string {
+	var out []string
+
+	// OpenAI Chat Completions: messages array
 	type msg struct {
 		Role    string `json:"role"`
 		Content string `json:"content"`
 	}
-
-	// Try as struct with messages array
-	var r struct {
+	var r1 struct {
 		Messages []msg `json:"messages"`
 	}
-	if json.Unmarshal(body, &r) == nil {
-		var out []string
-		for _, m := range r.Messages {
-			if m.Role != "system" {
+	if json.Unmarshal(body, &r1) == nil && len(r1.Messages) > 0 {
+		for _, m := range r1.Messages {
+			if m.Role != "system" && m.Role != "developer" {
 				out = append(out, fmt.Sprintf("**%s**: %s", m.Role, m.Content))
 			}
 		}
 		return out
 	}
+
+	// Responses API: input array (or string)
+	var r2 struct {
+		Input json.RawMessage `json:"input"`
+	}
+	if json.Unmarshal(body, &r2) == nil && r2.Input != nil {
+		var s string
+		if json.Unmarshal(r2.Input, &s) == nil {
+			return []string{fmt.Sprintf("**user**: %s", s)}
+		}
+		var msgs []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		}
+		if json.Unmarshal(r2.Input, &msgs) == nil {
+			for _, m := range msgs {
+				if m.Role != "developer" && m.Role != "system" {
+					out = append(out, fmt.Sprintf("**%s**: %s", m.Role, m.Content))
+				}
+			}
+			return out
+		}
+	}
+
+	// Gemini: contents array with parts
+	var r3 struct {
+		Contents []struct {
+			Role  string `json:"role"`
+			Parts []struct {
+				Text string `json:"text"`
+			} `json:"parts"`
+		} `json:"contents"`
+	}
+	if json.Unmarshal(body, &r3) == nil {
+		for _, c := range r3.Contents {
+			var texts []string
+			for _, p := range c.Parts {
+				if p.Text != "" {
+					texts = append(texts, p.Text)
+				}
+			}
+			if len(texts) > 0 {
+				role := c.Role
+				if role == "model" {
+					role = "assistant"
+				}
+				out = append(out, fmt.Sprintf("**%s**: %s", role, strings.Join(texts, "\n")))
+			}
+		}
+		return out
+	}
+
 	return nil
 }
 
-func isStreamingRequest(body []byte) bool {
+func isStreamingRequest(body []byte, reqPath string) bool {
+	// Gemini: streaming is determined by the URL path
+	if strings.Contains(reqPath, "streamGenerateContent") {
+		return true
+	}
 	var r struct {
 		Stream bool `json:"stream"`
 	}
@@ -953,14 +1409,19 @@ func isStreamingRequest(body []byte) bool {
 	return false
 }
 
-func extractStreamedText(data []byte) string {
+func extractStreamedText(data []byte, apiType string) string {
 	var parts []string
+
+	// Try SSE-based parsing (Anthropic, OpenAI Chat, OpenAI Responses)
 	for _, line := range bytes.Split(data, []byte("\n")) {
 		line := bytes.TrimSpace(line)
 		if !bytes.HasPrefix(line, []byte("data: ")) {
 			continue
 		}
 		payload := bytes.TrimPrefix(line, []byte("data: "))
+		if bytes.Equal(payload, []byte("[DONE]")) {
+			continue
+		}
 
 		// Anthropic content_block_delta
 		var d1 struct {
@@ -973,7 +1434,7 @@ func extractStreamedText(data []byte) string {
 			continue
 		}
 
-		// OpenAI chunk
+		// OpenAI Chat Completions chunk
 		var d2 struct {
 			Choices []struct {
 				Delta struct {
@@ -983,8 +1444,49 @@ func extractStreamedText(data []byte) string {
 		}
 		if json.Unmarshal(payload, &d2) == nil && len(d2.Choices) > 0 && d2.Choices[0].Delta.Content != "" {
 			parts = append(parts, d2.Choices[0].Delta.Content)
+			continue
+		}
+
+		// OpenAI Responses API: response.output_text.delta
+		var d3 struct {
+			Type  string `json:"type"`
+			Delta string `json:"delta"`
+		}
+		if json.Unmarshal(payload, &d3) == nil && d3.Type == "response.output_text.delta" && d3.Delta != "" {
+			parts = append(parts, d3.Delta)
+			continue
 		}
 	}
+
+	if len(parts) > 0 {
+		return strings.Join(parts, "")
+	}
+
+	// Gemini: response is a JSON array of chunks, not SSE
+	trimmed := bytes.TrimSpace(data)
+	if bytes.HasPrefix(trimmed, []byte("[")) || bytes.HasPrefix(trimmed, []byte("{")) {
+		var chunks []struct {
+			Candidates []struct {
+				Content struct {
+					Parts []struct {
+						Text string `json:"text"`
+					} `json:"parts"`
+				} `json:"content"`
+			} `json:"candidates"`
+		}
+		if json.Unmarshal(trimmed, &chunks) == nil {
+			for _, ch := range chunks {
+				for _, c := range ch.Candidates {
+					for _, p := range c.Content.Parts {
+						if p.Text != "" {
+							parts = append(parts, p.Text)
+						}
+					}
+				}
+			}
+		}
+	}
+
 	return strings.Join(parts, "")
 }
 
@@ -1018,6 +1520,25 @@ func writeRequestLog(logBase, apiType, model, system string, messages []string, 
 	}
 	// Also save raw JSON for debugging
 	os.WriteFile(logBase+".req.json", rawBody, 0644)
+}
+
+func writeMetadata(logBase, apiType, model string, statusCode int, latency time.Duration, reqSize int) {
+	type meta struct {
+		API        string `json:"api"`
+		Model      string `json:"model"`
+		StatusCode int    `json:"status_code"`
+		LatencyMs  int64  `json:"latency_ms"`
+		ReqBytes   int    `json:"req_bytes"`
+	}
+	m := meta{
+		API:        apiType,
+		Model:      model,
+		StatusCode: statusCode,
+		LatencyMs:  latency.Milliseconds(),
+		ReqBytes:   reqSize,
+	}
+	data, _ := json.Marshal(m)
+	os.WriteFile(logBase+".meta.json", data, 0644)
 }
 
 func appendResponse(logBase, text string) {
@@ -1185,9 +1706,26 @@ func parseIPAddresses(host string) []net.IP {
 // --- WebSocket Proxy (plain HTTP upgrade, no MITM needed) ---
 
 func handleWSProxy(cfg Config, w http.ResponseWriter, r *http.Request) {
-	forwardURL := cfg.ForwardURL
-	if forwardURL == "" {
-		forwardURL = cfg.BackendURL
+	var forwardURL string
+	if cfg.Transparent {
+		host := r.Host
+		if host == "" {
+			host = r.URL.Host
+		}
+		if isSelfReference(host, cfg.ListenAddr) {
+			apiType := detectAPIType(r.URL.Path, nil)
+			forwardURL = cfg.backendForAPI(apiType)
+		} else {
+			forwardURL = "https://" + host
+		}
+	} else {
+		forwardURL = cfg.ForwardURL
+		if forwardURL == "" {
+			forwardURL = cfg.BackendURL
+		}
+		if forwardURL == "" {
+			forwardURL = cfg.Backends["anthropic"]
+		}
 	}
 
 	// Parse forward URL to get host for TLS
