@@ -86,7 +86,7 @@ func isSelfReference(backendHost, listenAddr string) bool {
 	return false
 }
 
-func (c Config) backendForAPI(apiType string) string {
+func (c *Config) backendForAPI(apiType string) string {
 	if c.BackendURL != "" {
 		return c.BackendURL
 	}
@@ -104,7 +104,7 @@ func (c Config) backendForAPI(apiType string) string {
 // When the request targets the proxy itself (BASE_URL redirect), it uses the Backends
 // map to find the real upstream. Explicit overrides (BACKEND_URL, *_BACKEND env vars)
 // always take precedence.
-func (c Config) resolveTarget(r *http.Request, apiType string) string {
+func (c *Config) resolveTarget(r *http.Request, apiType string) string {
 	// Global override always wins
 	if c.BackendURL != "" {
 		return c.BackendURL
@@ -146,7 +146,7 @@ func (c Config) resolveTarget(r *http.Request, apiType string) string {
 
 // injectAPIKey replaces auth headers with the proxy's stored key for the given provider.
 // In transparent mode, the agent's own auth headers pass through — no injection.
-func (c Config) injectAPIKey(req *http.Request, apiType string) {
+func (c *Config) injectAPIKey(req *http.Request, apiType string) {
 	if c.Transparent {
 		return
 	}
@@ -238,26 +238,26 @@ func main() {
 	handler.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		// Inspect dashboard
 		if strings.HasPrefix(r.URL.Path, "/__inspect__") {
-			handleInspect(cfg, w, r)
+			handleInspect(&cfg, w, r)
 			return
 		}
 		// WebSocket upgrade — proxy raw TCP to real backend
 		if isWebSocketUpgrade(r) {
-			handleWSProxy(cfg, w, r)
+			handleWSProxy(&cfg, w, r)
 			return
 		}
 		if r.Method == http.MethodGet || r.Method == http.MethodHead {
-			proxyPassthrough(cfg, w, r)
+			proxyPassthrough(&cfg, w, r)
 			return
 		}
-		handleProxy(cfg, w, r)
+		handleProxy(&cfg, w, r)
 	})
 
 	// Wrap to intercept CONNECT (ServeMux doesn't handle it)
 	var mainHandler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodConnect {
 			if cfg.MitmEnabled {
-				handleConnect(cfg, w, r)
+				handleConnect(&cfg, w, r)
 			} else {
 				http.Error(w, "CONNECT not supported (enable MITM)", http.StatusMethodNotAllowed)
 			}
@@ -301,11 +301,11 @@ func main() {
 			log.Printf("Accept: %v", err)
 			continue
 		}
-		go handleRawConn(cfg, conn, mainHandler)
+		go handleRawConn(&cfg, conn, mainHandler)
 	}
 }
 
-func handleRawConn(cfg Config, conn net.Conn, handler http.Handler) {
+func handleRawConn(cfg *Config, conn net.Conn, handler http.Handler) {
 	// Peek at first byte to detect raw TLS vs HTTP
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	peek := make([]byte, 1)
@@ -381,7 +381,7 @@ func (l *singleConnListener) Close() error   { return nil }
 func (l *singleConnListener) Addr() net.Addr { return nil }
 
 // handleRawTLSMitm handles a direct TLS connection (no CONNECT) with MITM
-func handleRawTLSMitm(cfg Config, conn net.Conn, peek []byte) {
+func handleRawTLSMitm(cfg *Config, conn net.Conn, peek []byte) {
 	// Read more of the ClientHello to extract SNI
 	header := make([]byte, 5)
 	copy(header, peek)
@@ -586,7 +586,7 @@ func extractSNI(record []byte) string {
 }
 
 // handleRawTLSWSProxy handles a WebSocket upgrade on a raw TLS MITM connection.
-func handleRawTLSWSProxy(cfg Config, w http.ResponseWriter, r *http.Request, backend *sharedBackendReader, hostname string) {
+func handleRawTLSWSProxy(cfg *Config, w http.ResponseWriter, r *http.Request, backend *sharedBackendReader, hostname string) {
 	// Send the upgrade request to the real backend
 	var reqBuf bytes.Buffer
 	fmt.Fprintf(&reqBuf, "GET %s HTTP/1.1\r\n", r.URL.RequestURI())
@@ -712,7 +712,7 @@ func isWebSocketUpgrade(r *http.Request) bool {
 	return false
 }
 
-func proxyPassthrough(cfg Config, w http.ResponseWriter, r *http.Request) {
+func proxyPassthrough(cfg *Config, w http.ResponseWriter, r *http.Request) {
 	apiType := detectAPIType(r.URL.Path, nil)
 	target := cfg.resolveTarget(r, apiType)
 	reqURL := target + r.URL.Path
@@ -740,7 +740,7 @@ func proxyPassthrough(cfg Config, w http.ResponseWriter, r *http.Request) {
 	io.Copy(w, resp.Body)
 }
 
-func handleProxy(cfg Config, w http.ResponseWriter, r *http.Request) {
+func handleProxy(cfg *Config, w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "Failed to read body", http.StatusBadRequest)
@@ -828,7 +828,7 @@ type LogEntry struct {
 	Response string
 }
 
-func handleInspect(cfg Config, w http.ResponseWriter, r *http.Request) {
+func handleInspect(cfg *Config, w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
 	// Serve specific log file as JSON
@@ -1294,7 +1294,7 @@ func modifySystemInBody(body []byte, newSystem string) ([]byte, error) {
 	return json.Marshal(m)
 }
 
-func saveSystemPrompt(cfg Config, system string) {
+func saveSystemPrompt(cfg *Config, system string) {
 	agentDir := filepath.Join(cfg.LogDir, cfg.AgentType)
 	if err := os.MkdirAll(agentDir, 0755); err != nil {
 		log.Printf("Failed to create agent dir: %v", err)
@@ -1705,7 +1705,7 @@ func parseIPAddresses(host string) []net.IP {
 
 // --- WebSocket Proxy (plain HTTP upgrade, no MITM needed) ---
 
-func handleWSProxy(cfg Config, w http.ResponseWriter, r *http.Request) {
+func handleWSProxy(cfg *Config, w http.ResponseWriter, r *http.Request) {
 	var forwardURL string
 	if cfg.Transparent {
 		host := r.Host
@@ -1914,7 +1914,7 @@ func handleWSProxy(cfg Config, w http.ResponseWriter, r *http.Request) {
 	<-done
 }
 
-func handleConnect(cfg Config, w http.ResponseWriter, r *http.Request) {
+func handleConnect(cfg *Config, w http.ResponseWriter, r *http.Request) {
 	host := r.URL.Host
 	if !strings.Contains(host, ":") {
 		host += ":443"
@@ -2001,7 +2001,7 @@ type wsParseState struct {
 	decompressedLen   int           // bytes already decompressed from the accumulated stream
 }
 
-func mitmCopy(cfg Config, dst, src net.Conn, host, direction string, wsState *wsParseState, done chan struct{}) {
+func mitmCopy(cfg *Config, dst, src net.Conn, host, direction string, wsState *wsParseState, done chan struct{}) {
 	defer func() { done <- struct{}{} }()
 
 	buf := make([]byte, 64*1024)
@@ -2027,7 +2027,7 @@ func mitmCopy(cfg Config, dst, src net.Conn, host, direction string, wsState *ws
 	}
 }
 
-func (s *wsParseState) tryParseFrames(cfg Config) {
+func (s *wsParseState) tryParseFrames(cfg *Config) {
 	data := s.buf.Bytes()
 
 	// Skip HTTP request/response headers (and bodies for HTTP responses)
@@ -2180,7 +2180,7 @@ func tryParseOneFrame(data []byte) (*wsFrame, int, bool) {
 	return frame, offset + payloadLen, true
 }
 
-func (s *wsParseState) logFrame(cfg Config, f *wsFrame) {
+func (s *wsParseState) logFrame(cfg *Config, f *wsFrame) {
 	payload := f.Payload
 
 	// Decompress permessage-deflate (RSV1 set)
@@ -2284,7 +2284,7 @@ func frameType(payload []byte) string {
 	return "data"
 }
 
-func saveWSTraffic(cfg Config, host, direction string, payload []byte) {
+func saveWSTraffic(cfg *Config, host, direction string, payload []byte) {
 	agentLogDir := filepath.Join(cfg.LogDir, cfg.AgentType)
 	os.MkdirAll(agentLogDir, 0755)
 	timestamp := time.Now().Format("20060102-150405")
