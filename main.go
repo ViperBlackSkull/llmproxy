@@ -10,10 +10,10 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"embed"
 	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
-	"embed"
 	"flag"
 	"fmt"
 	"html/template"
@@ -24,10 +24,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"strconv"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -49,14 +49,14 @@ func redactSecrets(data []byte) []byte {
 	// - GitHub tokens (ghp_, gho_, ghu_, ghs_, ghr_)
 	// - Long hex/base64 strings (likely secrets)
 	patterns := []string{
-		`sk-ant-[A-Za-z0-9_-]{20,}`,                     // Anthropic
-		`sk-[A-Za-z0-9]{20,}`,                            // OpenAI-style
-		`Bearer\s+[A-Za-z0-9._-]{16,}`,                   // Bearer tokens
-		`x-api-key:\s*[A-Za-z0-9._-]{16,}`,              // API key headers
-		`AKIA[0-9A-Z]{16}`,                              // AWS access key
-		`gh[pousrp]_[A-Za-z0-9]{30,}`,                  // GitHub tokens
-		`[A-Fa-f0-9]{32,}`,                              // 32+ char hex (likely secret)
-		`[A-Za-z0-9+/]{40,}={0,2}`,                     // Base64-like (40+ chars)
+		`sk-ant-[A-Za-z0-9_-]{20,}`,        // Anthropic
+		`sk-[A-Za-z0-9]{20,}`,              // OpenAI-style
+		`Bearer\s+[A-Za-z0-9._-]{16,}`,     // Bearer tokens
+		`x-api-key:\s*[A-Za-z0-9._-]{16,}`, // API key headers
+		`AKIA[0-9A-Z]{16}`,                 // AWS access key
+		`gh[pousrp]_[A-Za-z0-9]{30,}`,      // GitHub tokens
+		`[A-Fa-f0-9]{32,}`,                 // 32+ char hex (likely secret)
+		`[A-Za-z0-9+/]{40,}={0,2}`,         // Base64-like (40+ chars)
 	}
 
 	result := string(data)
@@ -83,6 +83,9 @@ type Config struct {
 
 	// Per-provider API keys — only injected when Transparent=false or explicitly overridden
 	APIKeys map[string]string // "anthropic"|"openai"|"gemini" -> key
+
+	// Model remapping rules (MODEL_MAP): pattern=replacement, trailing '*' = prefix
+	ModelRules []modelRule
 
 	// MITM state
 	caCert    *x509.Certificate
@@ -177,21 +180,48 @@ func (c *Config) resolveTarget(r *http.Request, apiType string) string {
 	return c.backendForAPI(apiType)
 }
 
+// isSelfRefRequest reports whether the incoming request targets the proxy
+// itself (the agent pointed its BASE_URL at us) rather than an external API —
+// the same check resolveTarget uses to pick the Backends map for routing.
+func (c *Config) isSelfRefRequest(r *http.Request) bool {
+	host := r.Host
+	if host == "" {
+		host = r.URL.Host
+	}
+	return isSelfReference(host, c.ListenAddr)
+}
+
 // injectAPIKey replaces auth headers with the proxy's stored key for the given provider.
-// In transparent mode, the agent's own auth headers pass through — no injection.
-func (c *Config) injectAPIKey(req *http.Request, apiType string) {
+// In transparent mode, the agent's own auth headers pass through untouched — EXCEPT
+// when the request targets the proxy itself (BASE_URL redirect): the agent then sends
+// dummy or no credentials, so the stored real key is always injected (even in
+// transparent mode) and whatever auth the agent did send is stripped first.
+// Pass the ORIGINAL incoming request so the self-reference check can see its Host;
+// nil means "not self-referential" (caller couldn't determine it).
+func (c *Config) injectAPIKey(req *http.Request, apiType string, incoming *http.Request) {
 	if c.Transparent {
-		return
+		if incoming == nil || !c.isSelfRefRequest(incoming) {
+			return
+		}
 	}
 	key, ok := c.APIKeys[apiType]
 	if !ok || key == "" {
 		return
 	}
+	// Strip any auth the agent sent — the proxy is authoritative for this request
+	req.Header.Del("Authorization")
+	req.Header.Del("x-api-key")
+	req.Header.Del("x-goog-api-key")
 	switch apiType {
 	case "anthropic":
+		// z.ai's Anthropic-compatible endpoint authenticates via bearer token;
+		// native Anthropic uses x-api-key — set both so either upstream works.
 		req.Header.Set("x-api-key", key)
+		req.Header.Set("Authorization", "Bearer "+key)
+		log.Printf("auth: injected anthropic credentials (x-api-key + bearer)")
 	case "openai":
 		req.Header.Set("Authorization", "Bearer "+key)
+		log.Printf("auth: injected openai credentials (bearer)")
 	case "gemini":
 		req.Header.Set("x-goog-api-key", key)
 		// Also inject into query param if not present
@@ -200,10 +230,99 @@ func (c *Config) injectAPIKey(req *http.Request, apiType string) {
 			q.Set("key", key)
 			req.URL.RawQuery = q.Encode()
 		}
+		log.Printf("auth: injected gemini credentials (x-goog-api-key + key param)")
 	}
 }
 
+// --- Model remapping (MODEL_MAP) ---
+
+// modelRule is one pattern=replacement mapping rule from MODEL_MAP.
+// A trailing '*' in the pattern means prefix match.
+type modelRule struct {
+	pattern     string
+	prefix      bool
+	replacement string
+}
+
+// parseModelMap parses the MODEL_MAP env var: comma-separated pattern=replacement
+// rules where a pattern ending in '*' matches by prefix. Invalid entries are
+// skipped. First matching rule wins when remapping.
+func parseModelMap(s string) []modelRule {
+	var rules []modelRule
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		pattern, replacement, found := strings.Cut(part, "=")
+		if !found {
+			continue
+		}
+		pattern = strings.TrimSpace(pattern)
+		replacement = strings.TrimSpace(replacement)
+		prefix := strings.HasSuffix(pattern, "*")
+		if prefix {
+			pattern = strings.TrimSuffix(pattern, "*")
+		}
+		if pattern == "" || replacement == "" {
+			continue
+		}
+		rules = append(rules, modelRule{pattern: pattern, prefix: prefix, replacement: replacement})
+	}
+	return rules
+}
+
+// mapModel returns the replacement from the first matching rule, or "" when no
+// rule matches (the model passes through unchanged).
+func mapModel(rules []modelRule, model string) string {
+	for _, r := range rules {
+		if r.prefix {
+			if strings.HasPrefix(model, r.pattern) {
+				return r.replacement
+			}
+		} else if model == r.pattern {
+			return r.replacement
+		}
+	}
+	return ""
+}
+
+// rewriteModelInBody sets the JSON "model" field to newModel, preserving every
+// other field.
+func rewriteModelInBody(body []byte, newModel string) ([]byte, error) {
+	var m map[string]interface{}
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, err
+	}
+	m["model"] = newModel
+	return json.Marshal(m)
+}
+
+// rewriteGeminiModelPath replaces the model segment of a Gemini URL path
+// (/v1beta/models/<model>:generateContent) with newModel. Returns the path
+// unchanged when the exact model segment is not present.
+func rewriteGeminiModelPath(path, oldModel, newModel string) string {
+	seg := "/models/" + oldModel
+	idx := strings.Index(path, seg)
+	if idx == -1 {
+		return path
+	}
+	end := idx + len(seg)
+	// Only swap the exact segment — the next char must be ':', '/', or end-of-path
+	if end < len(path) && path[end] != ':' && path[end] != '/' {
+		return path
+	}
+	return path[:idx] + "/models/" + newModel + path[end:]
+}
+
 func main() {
+	// Load .env from the working directory first — real environment always
+	// wins over .env values (loadEnvFile never overwrites existing vars).
+	// A missing .env is a no-op, not an error.
+	if err := loadEnvFile("./.env"); err != nil && !os.IsNotExist(err) {
+		log.Printf("WARNING: failed to load .env: %v", err)
+	}
+
 	quiet := flag.Bool("q", false, "quiet mode — suppress all console output")
 	flag.Parse()
 	if *quiet {
@@ -216,11 +335,11 @@ func main() {
 	backendURL := strings.TrimRight(getEnv("BACKEND_URL", ""), "/")
 
 	cfg := Config{
-		ListenAddr: getEnv("LISTEN_ADDR", "127.0.0.1:8765"),
-		BackendURL: backendURL,
-		LogDir:     getEnv("LOG_DIR", "./logs"),
-		AgentType:  getEnv("AGENT_TYPE", "unknown"),
-		ForwardURL: getEnv("FORWARD_URL", ""),
+		ListenAddr:  getEnv("LISTEN_ADDR", "127.0.0.1:8765"),
+		BackendURL:  backendURL,
+		LogDir:      getEnv("LOG_DIR", "./logs"),
+		AgentType:   getEnv("AGENT_TYPE", "unknown"),
+		ForwardURL:  getEnv("FORWARD_URL", ""),
 		StripPrompt: getEnv("STRIP_PROMPT", "") == "true" || getEnv("STRIP_PROMPT", "") == "1",
 		Transparent: getEnv("TRANSPARENT", "true") == "true",
 		Backends: map[string]string{
@@ -233,6 +352,7 @@ func main() {
 			"openai":    os.Getenv("OPENAI_API_KEY"),
 			"gemini":    os.Getenv("GEMINI_API_KEY"),
 		},
+		ModelRules: parseModelMap(os.Getenv("MODEL_MAP")),
 	}
 
 	// Detect self-referential backend URLs (would cause infinite loop)
@@ -323,6 +443,9 @@ func main() {
 			log.Printf("  %s API key: configured (%d chars)", provider, len(key))
 		}
 	}
+	if len(cfg.ModelRules) > 0 {
+		log.Printf("Model map: %d rule(s) from MODEL_MAP", len(cfg.ModelRules))
+	}
 
 	// Inspect dashboard security notice
 	if os.Getenv("LLMPROXY_INSPECT_TOKEN") == "" {
@@ -373,8 +496,8 @@ func handleRawConn(cfg *Config, conn net.Conn, handler http.Handler) {
 // peekedConn wraps a net.Conn with pre-read bytes
 type peekedConn struct {
 	net.Conn
-	peek    []byte
-	peeked  bool
+	peek   []byte
+	peeked bool
 }
 
 func (c *peekedConn) Read(b []byte) (int, error) {
@@ -534,14 +657,15 @@ type pipeConnWrap struct {
 	r *io.PipeReader
 	w net.Conn
 }
-func (c *pipeConnWrap) Read(b []byte) (int, error)  { return c.r.Read(b) }
-func (c *pipeConnWrap) Write(b []byte) (int, error) { return c.w.Write(b) }
-func (c *pipeConnWrap) Close() error                 { c.r.Close(); return nil }
-func (c *pipeConnWrap) LocalAddr() net.Addr          { return nil }
-func (c *pipeConnWrap) RemoteAddr() net.Addr         { return nil }
-func (c *pipeConnWrap) SetDeadline(t time.Time) error       { return nil }
-func (c *pipeConnWrap) SetReadDeadline(t time.Time) error   { return nil }
-func (c *pipeConnWrap) SetWriteDeadline(t time.Time) error  { return nil }
+
+func (c *pipeConnWrap) Read(b []byte) (int, error)         { return c.r.Read(b) }
+func (c *pipeConnWrap) Write(b []byte) (int, error)        { return c.w.Write(b) }
+func (c *pipeConnWrap) Close() error                       { c.r.Close(); return nil }
+func (c *pipeConnWrap) LocalAddr() net.Addr                { return nil }
+func (c *pipeConnWrap) RemoteAddr() net.Addr               { return nil }
+func (c *pipeConnWrap) SetDeadline(t time.Time) error      { return nil }
+func (c *pipeConnWrap) SetReadDeadline(t time.Time) error  { return nil }
+func (c *pipeConnWrap) SetWriteDeadline(t time.Time) error { return nil }
 
 // extractSNI parses a TLS ClientHello to extract the SNI hostname
 func extractSNI(record []byte) string {
@@ -766,7 +890,7 @@ func proxyPassthrough(cfg *Config, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	copyHeaders(req.Header, r.Header)
-	cfg.injectAPIKey(req, apiType)
+	cfg.injectAPIKey(req, apiType, r)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -821,6 +945,30 @@ func handleProxy(cfg *Config, w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Model remapping (MODEL_MAP) — runs after the request log is written (so
+	// .req.json keeps the original model) but before forwarding, so the upstream
+	// sees the mapped one. First matching rule wins; unmatched models are
+	// forwarded unchanged.
+	mappedModel := ""
+	if mapped := mapModel(cfg.ModelRules, model); mapped != "" && mapped != model {
+		if apiType == "gemini" {
+			// Gemini carries the model in the URL path, not the body
+			newPath := rewriteGeminiModelPath(path, model, mapped)
+			if newPath != path {
+				path = newPath
+				mappedModel = mapped
+			}
+		} else if newBody, mapErr := rewriteModelInBody(body, mapped); mapErr == nil {
+			body = newBody
+			mappedModel = mapped
+		} else {
+			log.Printf("[map] failed to rewrite model in body: %v", mapErr)
+		}
+		if mappedModel != "" {
+			log.Printf("[map] model %s -> %s", model, mappedModel)
+		}
+	}
+
 	// Forward request to the target
 	target := cfg.resolveTarget(r, apiType)
 	reqURL := target + path
@@ -835,7 +983,7 @@ func handleProxy(cfg *Config, w http.ResponseWriter, r *http.Request) {
 	}
 	copyHeaders(req.Header, r.Header)
 	req.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
-	cfg.injectAPIKey(req, apiType)
+	cfg.injectAPIKey(req, apiType, r)
 
 	startTime := time.Now()
 	resp, err := http.DefaultClient.Do(req)
@@ -854,7 +1002,7 @@ func handleProxy(cfg *Config, w http.ResponseWriter, r *http.Request) {
 
 	isStream := isStreamingRequest(body, path)
 	proxyAndCapture(w, resp, logFile, isStream, apiType)
-	writeMetadata(logFile, apiType, model, resp.StatusCode, latency, len(body))
+	writeMetadata(logFile, apiType, model, mappedModel, resp.StatusCode, latency, len(body))
 }
 
 type LogEntry struct {
@@ -1614,20 +1762,22 @@ func writeRequestLog(logBase, apiType, model, system string, messages []string, 
 	os.WriteFile(logBase+".req.json", redactedBody, 0o600)
 }
 
-func writeMetadata(logBase, apiType, model string, statusCode int, latency time.Duration, reqSize int) {
+func writeMetadata(logBase, apiType, model, mappedModel string, statusCode int, latency time.Duration, reqSize int) {
 	type meta struct {
-		API        string `json:"api"`
-		Model      string `json:"model"`
-		StatusCode int    `json:"status_code"`
-		LatencyMs  int64  `json:"latency_ms"`
-		ReqBytes   int    `json:"req_bytes"`
+		API         string `json:"api"`
+		Model       string `json:"model"`
+		MappedModel string `json:"mapped_model,omitempty"`
+		StatusCode  int    `json:"status_code"`
+		LatencyMs   int64  `json:"latency_ms"`
+		ReqBytes    int    `json:"req_bytes"`
 	}
 	m := meta{
-		API:        apiType,
-		Model:      model,
-		StatusCode: statusCode,
-		LatencyMs:  latency.Milliseconds(),
-		ReqBytes:   reqSize,
+		API:         apiType,
+		Model:       model,
+		MappedModel: mappedModel,
+		StatusCode:  statusCode,
+		LatencyMs:   latency.Milliseconds(),
+		ReqBytes:    reqSize,
 	}
 	data, _ := json.Marshal(m)
 	os.WriteFile(logBase+".meta.json", data, 0o600)
@@ -1751,14 +1901,14 @@ func (c *Config) getLeafCert(host string) (*tls.Certificate, error) {
 
 	serialNumber, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	template := &x509.Certificate{
-		SerialNumber:    serialNumber,
-		Subject:         pkixName(host),
-		NotBefore:       time.Now().Add(-time.Hour),
-		NotAfter:        time.Now().Add(24 * time.Hour),
-		KeyUsage:        x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:        []string{host},
-		IPAddresses:     parseIPAddresses(host),
+		SerialNumber: serialNumber,
+		Subject:      pkixName(host),
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{host},
+		IPAddresses:  parseIPAddresses(host),
 	}
 
 	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -2086,11 +2236,11 @@ func handleConnect(cfg *Config, w http.ResponseWriter, r *http.Request) {
 
 // wsParseState tracks WebSocket frame parsing state across chunks
 type wsParseState struct {
-	host              string
-	direction         string
-	buf               bytes.Buffer  // accumulated raw TCP data for frame parsing
-	compressedAccum   bytes.Buffer  // accumulated compressed payloads (for shared deflate context)
-	decompressedLen   int           // bytes already decompressed from the accumulated stream
+	host            string
+	direction       string
+	buf             bytes.Buffer // accumulated raw TCP data for frame parsing
+	compressedAccum bytes.Buffer // accumulated compressed payloads (for shared deflate context)
+	decompressedLen int          // bytes already decompressed from the accumulated stream
 }
 
 func mitmCopy(cfg *Config, dst, src net.Conn, host, direction string, wsState *wsParseState, done chan struct{}) {
@@ -2186,11 +2336,9 @@ func (s *wsParseState) tryParseFrames(cfg *Config) {
 		break
 	}
 
-
 	if len(data) == 0 {
 		return
 	}
-
 
 	// Try to parse as many complete frames as possible
 	for {

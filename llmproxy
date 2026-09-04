@@ -46,6 +46,23 @@ cmd_inspect() {
     exit $?
 }
 
+cmd_serve() {
+    shift
+    PORT="${1:-8765}"
+    if [[ ! -x "$SCRIPT_DIR/llmproxyd" ]]; then
+        echo "Error: Cannot find llmproxyd binary. Run 'make build' first." >&2
+        exit 1
+    fi
+    mkdir -p "$LOG_DIR"
+    # Run from the repo root so the daemon picks up ./.env (keys, backends, MODEL_MAP)
+    cd "$SCRIPT_DIR"
+    echo "Credential-free proxy: http://localhost:$PORT" >&2
+    echo "Inspect dashboard:     http://localhost:$PORT/__inspect__" >&2
+    echo "(dashboard needs LLMPROXY_INSPECT_TOKEN from .env)" >&2
+    echo "Press Ctrl+C to stop" >&2
+    exec env LISTEN_ADDR="127.0.0.1:$PORT" AGENT_TYPE="proxy" LOG_DIR="$LOG_DIR" "$SCRIPT_DIR/llmproxyd"
+}
+
 cmd_help() {
     cat <<EOF
 Usage: llmproxy <command> [args...]
@@ -67,11 +84,17 @@ Supported agents (auto-detected):
   *                 Any other command (sets all known base URL env vars)
 
 Commands:
+  serve [port]      Run a credential-free proxy in the foreground (default: 8765).
+                    Point any agent at http://localhost:8765 with dummy or no
+                    credentials — real API keys, upstream backends, and model
+                    mapping (MODEL_MAP) are loaded from .env and injected upstream.
   logs              List captured logs
   logs open         Open inspect dashboard on historical logs
   inspect [port]    Open inspect dashboard (default: 8777)
 
 Examples:
+  llmproxy serve                  # credential-free proxy on :8765
+  llmproxy serve 9000             # ...on a custom port
   llmproxy claude -p "hello"
   llmproxy pi -p "hello"
   llmproxy codex "fix the bug"
@@ -84,6 +107,7 @@ Environment:
   LOG_DIR           Directory for logs (default: ./logs)
   PROXY_PORT        Force a specific proxy port
   TRANSPARENT       Set to "false" to use hardcoded backend overrides
+  MODEL_MAP         Model remap rules for serve mode (see .env.example)
 EOF
     exit 0
 }
@@ -95,6 +119,7 @@ fi
 case "${1:-}" in
     logs)   cmd_logs "$@" ;;
     inspect) cmd_inspect "$@" ;;
+    serve)  cmd_serve "$@" ;;
     help|--help|-h) cmd_help ;;
 esac
 

@@ -83,6 +83,9 @@ Requires Go 1.22+. The optional MITM libs in `lib/` also require gcc.
 # Gemini CLI
 ./llmproxy gemini -p "explain this code"
 
+# Credential-free proxy (see below)
+./llmproxy serve
+
 # Any command — sets all known env vars
 ./llmproxy curl -X POST http://localhost:8765/v1/messages ...
 
@@ -103,6 +106,36 @@ The proxy starts automatically, intercepts all API traffic, and shuts down when 
 ```
 
 Opens a web UI at `http://localhost:8777/__inspect__` where you can browse captured requests, view system prompts, and inspect raw JSON.
+
+### Credential-Free Mode
+
+```bash
+cp .env.example .env   # fill in your real key + backend
+./llmproxy serve       # foreground proxy on http://localhost:8765
+```
+
+`serve` runs a standalone proxy any agent can point at with **no real credentials**: point the agent's base URL at `http://localhost:8765`, send dummy or no API keys, and it still gets real completions. The daemon loads `.env` at startup, injects your real key upstream (both `x-api-key` and `Authorization: Bearer` for Anthropic-style upstreams — works with z.ai and native Anthropic alike), and remaps model names via `MODEL_MAP`:
+
+```
+Agent (base URL = http://localhost:8765, dummy credentials)
+  │
+  ▼
+llmproxyd (:8765)
+  ├── Detects API type, logs request (original model in .req.json)
+  ├── MODEL_MAP remap (e.g. claude-sonnet-5 -> glm-5.3, mapped_model in .meta.json)
+  ├── Strips the dummy auth, injects the real key from .env
+  └── Forwards to ANTHROPIC_BACKEND (e.g. https://api.z.ai/api/anthropic)
+```
+
+Plain `curl` with zero auth headers gets a real completion:
+
+```bash
+curl http://localhost:8765/v1/messages \
+  -H 'content-type: application/json' \
+  -d '{"model":"claude-sonnet-5","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}'
+```
+
+Transparent wrapping (the default `llmproxy <agent>` flow) is unchanged: traffic to the agent's real original destination still passes through with the agent's own credentials — injection only applies to requests that target the proxy itself.
 
 ### Standalone Mode
 
@@ -147,14 +180,20 @@ cp .env.example .env
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | — | Your Anthropic API key |
+| `ANTHROPIC_API_KEY` | — | Your Anthropic API key (injected upstream for self-referential/credential-free traffic) |
 | `OPENAI_API_KEY` | — | Your OpenAI API key |
 | `GEMINI_API_KEY` | — | Your Google Gemini API key |
+| `ANTHROPIC_BACKEND` | `https://api.anthropic.com` | Upstream for Anthropic-style requests (e.g. `https://api.z.ai/api/anthropic`) |
+| `OPENAI_BACKEND` | `https://api.openai.com` | Upstream for OpenAI-style requests |
+| `GEMINI_BACKEND` | `https://generativelanguage.googleapis.com` | Upstream for Gemini-style requests |
+| `MODEL_MAP` | — | Comma-separated `pattern=replacement` model remap rules; trailing `*` = prefix match; first match wins (e.g. `claude-sonnet-*=glm-5.3`) |
 | `LLMPROXY_INSPECT_TOKEN` | — | Bearer token for inspect dashboard (required to access `/__inspect__`) |
 | `BACKEND_URL` | Auto-detected per agent | Upstream API to forward to |
 | `PROXY_PORT` | First available from 8765-8770 | Proxy listen port |
 | `LOG_DIR` | `./logs` | Directory for captured logs |
 | `LISTEN_ADDR` | `127.0.0.1:8765` | Proxy listen address (standalone mode, loopback only) |
+
+The daemon loads `./.env` at startup (real environment variables win over `.env` values); see `.env.example` for a documented template.
 
 ## How It Works
 
