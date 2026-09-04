@@ -16,6 +16,7 @@
   .badge-gemini { background: #a29bfe; color: #1a1a2e; }
   .badge-unknown { background: #636e72; }
   .badge-agent { background: #00b894; color: #1a1a2e; }
+  .badge-ws { background: #00cec9; color: #1a1a2e; }
   .time { color: #b2bec3; font-size: 13px; }
   .model { color: #00cec9; font-size: 13px; }
   .entry-detail { display: none; padding: 0 16px 16px; border-top: 1px solid #0f3460; }
@@ -27,10 +28,28 @@
   .tab { padding: 4px 10px; border-radius: 4px; font-size: 12px; cursor: pointer; background: #0f3460; border: none; color: #eee; }
   .tab.active { background: #e94560; }
   .empty { text-align: center; padding: 40px; color: #636e72; }
+
+  /* Live connection pill */
+  .pill { display: inline-block; vertical-align: middle; margin-left: 14px; padding: 3px 12px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .pill-live { background: #00b894; color: #1a1a2e; }
+  .pill-off { background: #ffeaa7; color: #1a1a2e; }
+
+  /* In-flight vs completed entry states */
+  .entry.in-flight { border-left: 3px solid #ffeaa7; animation: inflight-pulse 1.2s ease-in-out infinite; }
+  .status { display: inline-flex; align-items: center; gap: 6px; color: #ffeaa7; font-size: 12px; font-weight: 600; }
+  .status .dot { width: 8px; height: 8px; border-radius: 50%; background: #ffeaa7; animation: inflight-pulse 0.9s ease-in-out infinite; }
+  @keyframes inflight-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+  .status-latency { padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 700; color: #1a1a2e; }
+  .latency-fast { background: #00b894; }
+  .latency-mid { background: #ffeaa7; }
+  .latency-slow { background: #e94560; }
+  .status-error { padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 700; background: #e94560; color: #1a1a2e; }
+  .entry.ws-entry { border-left: 3px solid #00cec9; }
 </style>
 </head>
 <body>
-<h1>LLM Proxy Inspector</h1>
+<h1>LLM Proxy Inspector <span id="live-pill" class="pill pill-off">○ Connecting…</span></h1>
+<div id="entries">
 {{if .Entries}}
   {{range .Entries}}
   <div class="entry" onclick="toggleEntry(this)" data-file="{{.Filename}}" data-agent="{{.Agent}}">
@@ -43,8 +62,8 @@
     </div>
     <div class="entry-detail">
       <div class="tabs">
-        <button class="tab active" onclick="showTab(this,'rendered')">Rendered</button>
-        <button class="tab" onclick="showTab(this,'raw')">Raw JSON</button>
+        <button class="tab active" onclick="showTab(this,'rendered',event)">Rendered</button>
+        <button class="tab" onclick="showTab(this,'raw',event)">Raw JSON</button>
       </div>
       <div class="tab-content rendered"><pre></pre></div>
       <div class="tab-content raw" style="display:none"><pre></pre></div>
@@ -54,6 +73,7 @@
 {{else}}
   <div class="empty">No captured requests yet. Run a command through the proxy.</div>
 {{end}}
+</div>
 <script>
 function toggleEntry(el) {
   el.classList.toggle('open');
@@ -61,7 +81,9 @@ function toggleEntry(el) {
     el.dataset.loaded = '1';
     var path = el.dataset.file;
     if (el.dataset.agent) path = el.dataset.agent + '/' + path;
-    fetch('/__inspect__/api/' + path)
+    // location.search carries the ?token= the page was loaded with — the
+    // fetch needs it too (browsers can't set an Authorization header here).
+    fetch('/__inspect__/api/' + path + location.search)
       .then(r => r.json())
       .then(data => {
         el.querySelector('.rendered pre').textContent = data.markdown || '(empty)';
@@ -69,12 +91,163 @@ function toggleEntry(el) {
       });
   }
 }
-function showTab(btn, name) {
+function showTab(btn, name, ev) {
+  if (ev) ev.stopPropagation(); // don't bubble to the entry's toggle handler
   const detail = btn.closest('.entry-detail');
   detail.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   btn.classList.add('active');
   detail.querySelectorAll('.tab-content').forEach(c => c.style.display = 'none');
   detail.querySelector('.' + name).style.display = '';
+}
+
+// --- Live updates over SSE ---
+var entriesEl = document.getElementById('entries');
+
+function h(tag, cls, text) {
+  var el = document.createElement(tag);
+  if (cls) el.className = cls;
+  if (text !== undefined) el.textContent = text;
+  return el;
+}
+
+function cssEscape(s) {
+  if (window.CSS && CSS.escape) return CSS.escape(s);
+  return s.replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+}
+
+function latencyClass(ms) {
+  return ms < 2000 ? 'latency-fast' : ms < 10000 ? 'latency-mid' : 'latency-slow';
+}
+
+function findEntry(file) {
+  return entriesEl.querySelector('.entry[data-file="' + cssEscape(file) + '"]');
+}
+
+function prependEntry(el) {
+  var empty = entriesEl.querySelector('.empty');
+  if (empty) empty.remove();
+  entriesEl.insertBefore(el, entriesEl.firstChild);
+}
+
+// Build an entry node with the same markup/classes as the server-rendered
+// ones, so toggleEntry's lazy fetch keeps working via data-file/data-agent.
+function buildEntry(o) {
+  var e = h('div', 'entry' + (o.inFlight ? ' in-flight' : '') + (o.ws ? ' ws-entry' : ''));
+  e.setAttribute('data-file', o.file);
+  if (o.agent) e.setAttribute('data-agent', o.agent);
+  e.onclick = function () { toggleEntry(e); };
+
+  var hdr = h('div', 'entry-header');
+  if (o.agent) hdr.appendChild(h('span', 'badge badge-agent', o.agent));
+  if (o.ws) {
+    var arrow = o.direction === 'response' ? '←' : '→';
+    hdr.appendChild(h('span', 'badge badge-ws', 'ws ' + arrow + ' ' + o.host));
+  } else {
+    hdr.appendChild(h('span', 'badge badge-' + o.api, o.api));
+  }
+  if (o.model) hdr.appendChild(h('span', 'model', o.model));
+  hdr.appendChild(h('span', 'time', o.time));
+  if (o.inFlight) {
+    var st = h('span', 'status');
+    st.appendChild(h('span', 'dot'));
+    st.appendChild(document.createTextNode('in flight…'));
+    hdr.appendChild(st);
+  } else if (o.error) {
+    hdr.appendChild(h('span', 'status-error', 'error'));
+  } else if (o.done) {
+    hdr.appendChild(h('span', 'status-latency ' + latencyClass(o.latencyMs || 0), (o.latencyMs || 0) + 'ms'));
+  }
+  if (o.preview) hdr.appendChild(h('span', 'system-preview', o.preview));
+
+  var detail = h('div', 'entry-detail');
+  var tabs = h('div', 'tabs');
+  var bRendered = h('button', 'tab active', 'Rendered');
+  bRendered.onclick = function (ev) { showTab(bRendered, 'rendered', ev); };
+  var bRaw = h('button', 'tab', 'Raw JSON');
+  bRaw.onclick = function (ev) { showTab(bRaw, 'raw', ev); };
+  tabs.appendChild(bRendered);
+  tabs.appendChild(bRaw);
+  detail.appendChild(tabs);
+  detail.appendChild(h('div', 'tab-content rendered')).appendChild(h('pre'));
+  var rawWrap = h('div', 'tab-content raw');
+  rawWrap.style.display = 'none';
+  rawWrap.appendChild(h('pre'));
+  detail.appendChild(rawWrap);
+  e.appendChild(hdr);
+  e.appendChild(detail);
+  return e;
+}
+
+function handleEvent(evt) {
+  var time = evt.ts ? new Date(evt.ts).toLocaleTimeString() : new Date().toLocaleTimeString();
+  if (evt.type === 'request') {
+    prependEntry(buildEntry({
+      file: evt.file, agent: evt.agent, api: evt.api, model: evt.model,
+      time: time, preview: evt.preview, inFlight: true
+    }));
+  } else if (evt.type === 'response') {
+    var el = findEntry(evt.file);
+    if (el) {
+      updateEntry(el, evt);
+    } else {
+      // Page loaded mid-flight (request event missed) — materialize done state.
+      prependEntry(buildEntry({
+        file: evt.file, agent: evt.agent, api: evt.api,
+        model: evt.mapped_model && evt.model ? evt.model + ' → ' + evt.mapped_model : (evt.model || evt.mapped_model),
+        time: time, preview: evt.preview,
+        done: evt.status !== 'error', error: evt.status === 'error',
+        latencyMs: evt.latency_ms
+      }));
+    }
+  } else if (evt.type === 'ws') {
+    prependEntry(buildEntry({
+      file: evt.file, agent: evt.agent, ws: true, host: evt.host,
+      direction: evt.direction, time: time, preview: evt.preview
+    }));
+  }
+}
+
+function updateEntry(el, evt) {
+  el.classList.remove('in-flight');
+  var hdr = el.querySelector('.entry-header');
+  var previewEl = hdr.querySelector('.system-preview');
+  if (evt.status === 'error') {
+    var errBadge = h('span', 'status-error', 'error');
+    var st = hdr.querySelector('.status');
+    if (st) st.replaceWith(errBadge);
+    else if (previewEl) hdr.insertBefore(errBadge, previewEl);
+    else hdr.appendChild(errBadge);
+  } else {
+    var badge = h('span', 'status-latency ' + latencyClass(evt.latency_ms || 0), (evt.latency_ms || 0) + 'ms');
+    var st2 = hdr.querySelector('.status');
+    if (st2) st2.replaceWith(badge);
+    else if (previewEl) hdr.insertBefore(badge, previewEl);
+    else hdr.appendChild(badge);
+  }
+  if (evt.preview && previewEl) previewEl.textContent = evt.preview;
+  if (evt.mapped_model) {
+    var m = hdr.querySelector('.model');
+    if (m && evt.model && m.textContent === evt.model) {
+      m.textContent = evt.model + ' → ' + evt.mapped_model;
+    }
+  }
+}
+
+var pill = document.getElementById('live-pill');
+function setPill(text, cls) {
+  pill.textContent = text;
+  pill.className = 'pill ' + cls;
+}
+
+if (typeof EventSource !== 'undefined') {
+  var es = new EventSource('/__inspect__/events' + location.search);
+  es.onopen = function () { setPill('● Live', 'pill-live'); };
+  es.onerror = function () { setPill('○ Reconnecting…', 'pill-off'); };
+  es.onmessage = function (m) {
+    try { handleEvent(JSON.parse(m.data)); } catch (e) { /* malformed frame — skip */ }
+  };
+} else {
+  setPill('○ Unsupported', 'pill-off');
 }
 </script>
 </body>

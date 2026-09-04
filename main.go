@@ -932,6 +932,23 @@ func handleProxy(cfg *Config, w http.ResponseWriter, r *http.Request) {
 	logFile := fmt.Sprintf("%s/%s-%s", agentLogDir, timestamp, apiType)
 	writeRequestLog(logFile, apiType, model, system, messages, body)
 
+	// Live dashboard: this request is now in flight. The file basename (with
+	// .md) matches what the dashboard uses for data-file lookups.
+	previewSrc := system
+	if previewSrc == "" && len(messages) > 0 {
+		previewSrc = messages[0]
+	}
+	evtFile := filepath.Base(logFile) + ".md"
+	eventHub.Broadcast(Event{
+		Type:    "request",
+		Agent:   cfg.AgentType,
+		API:     apiType,
+		Model:   model,
+		File:    evtFile,
+		Status:  "in_flight",
+		Preview: eventPreview(previewSrc),
+	})
+
 	// Strip system prompt restrictions if enabled
 	if cfg.StripPrompt && system != "" {
 		if modified := stripSystemPrompt(system); modified != system {
@@ -979,6 +996,7 @@ func handleProxy(cfg *Config, w http.ResponseWriter, r *http.Request) {
 	req, err := http.NewRequest(r.Method, reqURL, bytes.NewReader(body))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
+		broadcastError(cfg, apiType, model, evtFile, err.Error())
 		return
 	}
 	copyHeaders(req.Header, r.Header)
@@ -990,6 +1008,7 @@ func handleProxy(cfg *Config, w http.ResponseWriter, r *http.Request) {
 	latency := time.Since(startTime)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Backend error: %v", err), http.StatusBadGateway)
+		broadcastError(cfg, apiType, model, evtFile, err.Error())
 		return
 	}
 	defer resp.Body.Close()
@@ -1001,8 +1020,39 @@ func handleProxy(cfg *Config, w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(resp.StatusCode)
 
 	isStream := isStreamingRequest(body, path)
-	proxyAndCapture(w, resp, logFile, isStream, apiType)
+	responseText := proxyAndCapture(w, resp, logFile, isStream, apiType)
 	writeMetadata(logFile, apiType, model, mappedModel, resp.StatusCode, latency, len(body))
+
+	// Live dashboard: response landed (error when the upstream returned ≥400).
+	status := "done"
+	if resp.StatusCode >= 400 {
+		status = "error"
+	}
+	eventHub.Broadcast(Event{
+		Type:        "response",
+		Agent:       cfg.AgentType,
+		API:         apiType,
+		Model:       model,
+		MappedModel: mappedModel,
+		File:        evtFile,
+		Status:      status,
+		LatencyMS:   latency.Milliseconds(),
+		Preview:     eventPreview(responseText),
+	})
+}
+
+// broadcastError flips the dashboard's in-flight entry for file to an error
+// state when a request fails before a response exists.
+func broadcastError(cfg *Config, apiType, model, file, msg string) {
+	eventHub.Broadcast(Event{
+		Type:    "response",
+		Agent:   cfg.AgentType,
+		API:     apiType,
+		Model:   model,
+		File:    file,
+		Status:  "error",
+		Preview: eventPreview(msg),
+	})
 }
 
 type LogEntry struct {
@@ -1069,6 +1119,14 @@ func handleInspect(cfg *Config, w http.ResponseWriter, r *http.Request) {
 	}
 
 	path := r.URL.Path
+
+	// SSE live-event stream (routed before the generic dashboard handler).
+	// Auth via checkInspectAuth above; the ?token= query param is what makes
+	// EventSource work, since it cannot set headers.
+	if path == "/__inspect__/events" {
+		serveInspectEvents(w, r)
+		return
+	}
 
 	// Serve specific log file as JSON
 	if strings.HasPrefix(path, "/__inspect__/api/") {
@@ -1199,18 +1257,25 @@ func readFile(path string) string {
 	return string(data)
 }
 
-func proxyAndCapture(w http.ResponseWriter, resp *http.Response, logBase string, isStream bool, apiType string) {
+// proxyAndCapture streams the upstream response to the client while capturing
+// it, appends the extracted text to the log, and returns that text (used for
+// the live dashboard response preview).
+func proxyAndCapture(w http.ResponseWriter, resp *http.Response, logBase string, isStream bool, apiType string) string {
 	if !isStream {
 		body, _ := io.ReadAll(resp.Body)
 		w.Write(body)
 		appendResponse(logBase, string(body))
-		return
+		return string(body)
 	}
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		io.Copy(w, resp.Body)
-		return
+		// No streaming flush support — copy through while still capturing.
+		var captured bytes.Buffer
+		io.Copy(io.MultiWriter(w, &captured), resp.Body)
+		text := extractStreamedText(captured.Bytes(), apiType)
+		appendResponse(logBase, text)
+		return text
 	}
 
 	var captured bytes.Buffer
@@ -1232,7 +1297,9 @@ func proxyAndCapture(w http.ResponseWriter, resp *http.Response, logBase string,
 		}
 	}
 
-	appendResponse(logBase, extractStreamedText(captured.Bytes(), apiType))
+	text := extractStreamedText(captured.Bytes(), apiType)
+	appendResponse(logBase, text)
+	return text
 }
 
 func detectAPIType(path string, body []byte) string {
@@ -2553,4 +2620,16 @@ func saveWSTraffic(cfg *Config, host, direction string, payload []byte) {
 
 	out, _ := json.MarshalIndent(entries, "", "  ")
 	os.WriteFile(logFile, out, 0o600)
+
+	// Live dashboard: WS frame captured (file basename points at the .json
+	// log, which /__inspect__/api/ serves via its markdown field).
+	eventHub.Broadcast(Event{
+		Type:      "ws",
+		Agent:     cfg.AgentType,
+		API:       "ws",
+		File:      filepath.Base(logFile),
+		Host:      host,
+		Direction: direction,
+		Preview:   eventPreview(string(payload)),
+	})
 }

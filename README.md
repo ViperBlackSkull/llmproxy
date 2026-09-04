@@ -107,6 +107,8 @@ The proxy starts automatically, intercepts all API traffic, and shuts down when 
 
 Opens a web UI at `http://localhost:8777/__inspect__` where you can browse captured requests, view system prompts, and inspect raw JSON.
 
+The dashboard is **live**: while it is open, new requests stream in over Server-Sent Events (`/__inspect__/events`) the moment they hit the proxy — an in-flight indicator while the model generates, then a latency badge when the response lands. No reload needed.
+
 ### Credential-Free Mode
 
 ```bash
