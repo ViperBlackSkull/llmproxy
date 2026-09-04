@@ -114,14 +114,27 @@ go run . # listens on :8765, forwards to api.anthropic.com
 
 Then point any tool at `http://localhost:8765`.
 
-## Security Notice
+## Security
 
-llmproxy is a **local development tool** for inspecting your own LLM API traffic. It is designed to run on `localhost` only.
+llmproxy is a **local development tool** for inspecting your own LLM API traffic.
 
-- The MITM/TLS interception features (`lib/intercept.c`, `lib/redirect.c`, `examples/grab.py`) are intended for **authorized testing and research** on your own machines.
-- The inspect dashboard binds to localhost and has no authentication — do not expose it to a network.
-- API keys are read from environment variables, never hardcoded. Keep your `.env` files out of version control (they're in `.gitignore`).
-- Do not use this tool to intercept traffic you are not authorized to intercept.
+### Critical Security Considerations
+
+- **Inspect Dashboard**: The `/__inspect__` endpoint exposes every proxied prompt verbatim, including full system prompts and user messages. By default, this endpoint is **disabled** and returns 404. To enable it, you must set `LLMPROXY_INSPECT_TOKEN` — then all inspect requests require bearer token authentication (or `?token=` query param).
+- **Network Binding**: The proxy binds to `127.0.0.1:8765` (loopback only) by default. Do not run on shared networks or expose the port externally. Use `LISTEN_ADDR` to override only if you understand the risks.
+- **Log Files**: Request logs are written to `./logs/` with restrictive permissions (`0o700` directories, `0o600` files). Secrets in request bodies (API keys, bearer tokens) are redacted as `<REDACTED>`, but prompts may still contain sensitive information.
+- **API Keys**: Keys are read from environment variables, never hardcoded. Keep your `.env` files out of version control (they're in `.gitignore`).
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LLMPROXY_INSPECT_TOKEN` | — | Bearer token required for `/__inspect__*` endpoints. If unset, dashboard is disabled (404) |
+| `LISTEN_ADDR` | `127.0.0.1:8765` | Proxy listen address (loopback only by default) |
+
+### Authorization
+
+The MITM/TLS interception features (`lib/intercept.c`, `lib/redirect.c`, `examples/grab.py`) are intended for **authorized testing and research** on your own machines. Do not use this tool to intercept traffic you are not authorized to intercept.
 
 ## Configuration
 
@@ -137,10 +150,11 @@ cp .env.example .env
 | `ANTHROPIC_API_KEY` | — | Your Anthropic API key |
 | `OPENAI_API_KEY` | — | Your OpenAI API key |
 | `GEMINI_API_KEY` | — | Your Google Gemini API key |
+| `LLMPROXY_INSPECT_TOKEN` | — | Bearer token for inspect dashboard (required to access `/__inspect__`) |
 | `BACKEND_URL` | Auto-detected per agent | Upstream API to forward to |
 | `PROXY_PORT` | First available from 8765-8770 | Proxy listen port |
 | `LOG_DIR` | `./logs` | Directory for captured logs |
-| `LISTEN_ADDR` | `:8765` | Proxy listen address (standalone mode) |
+| `LISTEN_ADDR` | `127.0.0.1:8765` | Proxy listen address (standalone mode, loopback only) |
 
 ## How It Works
 

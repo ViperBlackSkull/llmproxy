@@ -26,6 +26,7 @@ import (
 	"os"
 	"strconv"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -34,6 +35,38 @@ import (
 
 //go:embed web/inspect.html
 var webFS embed.FS
+
+// redactSecrets masks key-shaped substrings in the input to prevent
+// accidental logging of sensitive credentials. It replaces matches
+// with "<REDACTED>".
+func redactSecrets(data []byte) []byte {
+	// Patterns to redact (in order of specificity):
+	// - sk-ant-api03-... (Anthropic API keys)
+	// - sk-... (OpenAI API keys)
+	// - Bearer <token> headers
+	// - x-api-key values
+	// - AWS keys (AKIA...)
+	// - GitHub tokens (ghp_, gho_, ghu_, ghs_, ghr_)
+	// - Long hex/base64 strings (likely secrets)
+	patterns := []string{
+		`sk-ant-[A-Za-z0-9_-]{20,}`,                     // Anthropic
+		`sk-[A-Za-z0-9]{20,}`,                            // OpenAI-style
+		`Bearer\s+[A-Za-z0-9._-]{16,}`,                   // Bearer tokens
+		`x-api-key:\s*[A-Za-z0-9._-]{16,}`,              // API key headers
+		`AKIA[0-9A-Z]{16}`,                              // AWS access key
+		`gh[pousrp]_[A-Za-z0-9]{30,}`,                  // GitHub tokens
+		`[A-Fa-f0-9]{32,}`,                              // 32+ char hex (likely secret)
+		`[A-Za-z0-9+/]{40,}={0,2}`,                     // Base64-like (40+ chars)
+	}
+
+	result := string(data)
+	for _, pattern := range patterns {
+		re := regexp.MustCompile(pattern)
+		// Replace with just the prefix preserved for context, or <REDACTED>
+		result = re.ReplaceAllString(result, "<REDACTED>")
+	}
+	return []byte(result)
+}
 
 type Config struct {
 	ListenAddr  string
@@ -183,7 +216,7 @@ func main() {
 	backendURL := strings.TrimRight(getEnv("BACKEND_URL", ""), "/")
 
 	cfg := Config{
-		ListenAddr: getEnv("LISTEN_ADDR", ":8765"),
+		ListenAddr: getEnv("LISTEN_ADDR", "127.0.0.1:8765"),
 		BackendURL: backendURL,
 		LogDir:     getEnv("LOG_DIR", "./logs"),
 		AgentType:  getEnv("AGENT_TYPE", "unknown"),
@@ -216,7 +249,7 @@ func main() {
 		}
 	}
 
-	if err := os.MkdirAll(cfg.LogDir, 0755); err != nil {
+	if err := os.MkdirAll(cfg.LogDir, 0o700); err != nil {
 		log.Fatalf("Failed to create log dir: %v", err)
 	}
 
@@ -289,6 +322,13 @@ func main() {
 		if key != "" {
 			log.Printf("  %s API key: configured (%d chars)", provider, len(key))
 		}
+	}
+
+	// Inspect dashboard security notice
+	if os.Getenv("LLMPROXY_INSPECT_TOKEN") == "" {
+		log.Printf("Inspect dashboard: DISABLED (set LLMPROXY_INSPECT_TOKEN to enable /__inspect__)")
+	} else {
+		log.Printf("Inspect dashboard: ENABLED (requires LLMPROXY_INSPECT_TOKEN)")
 	}
 
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
@@ -763,7 +803,7 @@ func handleProxy(cfg *Config, w http.ResponseWriter, r *http.Request) {
 
 	// Write request log to per-agent subdirectory
 	agentLogDir := filepath.Join(cfg.LogDir, cfg.AgentType)
-	os.MkdirAll(agentLogDir, 0755)
+	os.MkdirAll(agentLogDir, 0o700)
 	timestamp := time.Now().Format("20060102-150405")
 	logFile := fmt.Sprintf("%s/%s-%s", agentLogDir, timestamp, apiType)
 	writeRequestLog(logFile, apiType, model, system, messages, body)
@@ -828,7 +868,58 @@ type LogEntry struct {
 	Response string
 }
 
+// checkInspectAuth verifies the LLMPROXY_INSPECT_TOKEN for inspect endpoints.
+// Returns true if auth is valid, false if it failed (and response was sent).
+func checkInspectAuth(w http.ResponseWriter, r *http.Request) bool {
+	token := os.Getenv("LLMPROXY_INSPECT_TOKEN")
+
+	// If no token is set, disable the dashboard entirely
+	if token == "" {
+		http.NotFound(w, r)
+		return false
+	}
+
+	// Check Authorization header for Bearer token
+	authHeader := r.Header.Get("Authorization")
+	if authHeader != "" {
+		// Accept both "Bearer <token>" and "Bearer:<token>" (common variations)
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			if authHeader[7:] == token {
+				return true
+			}
+		}
+		if strings.HasPrefix(authHeader, "Bearer:") {
+			if authHeader[7:] == token {
+				return true
+			}
+		}
+		// Also accept just "Bearer" as prefix without space
+		if len(authHeader) > 6 && strings.EqualFold(authHeader[:6], "Bearer") {
+			trimmed := strings.TrimSpace(authHeader[6:])
+			if trimmed == token {
+				return true
+			}
+		}
+	}
+
+	// Check query parameter ?token=
+	queryToken := r.URL.Query().Get("token")
+	if queryToken == token {
+		return true
+	}
+
+	// No valid token found
+	w.Header().Set("WWW-Authenticate", "Bearer")
+	http.Error(w, "Unauthorized", http.StatusUnauthorized)
+	return false
+}
+
 func handleInspect(cfg *Config, w http.ResponseWriter, r *http.Request) {
+	// Check authorization before processing any inspect request
+	if !checkInspectAuth(w, r) {
+		return
+	}
+
 	path := r.URL.Path
 
 	// Serve specific log file as JSON
@@ -1296,7 +1387,7 @@ func modifySystemInBody(body []byte, newSystem string) ([]byte, error) {
 
 func saveSystemPrompt(cfg *Config, system string) {
 	agentDir := filepath.Join(cfg.LogDir, cfg.AgentType)
-	if err := os.MkdirAll(agentDir, 0755); err != nil {
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
 		log.Printf("Failed to create agent dir: %v", err)
 		return
 	}
@@ -1313,12 +1404,12 @@ func saveSystemPrompt(cfg *Config, system string) {
 		return
 	}
 
-	if err := os.WriteFile(promptPath, []byte(system), 0644); err != nil {
+	if err := os.WriteFile(promptPath, []byte(system), 0o600); err != nil {
 		log.Printf("Failed to save system prompt: %v", err)
 	} else {
 		log.Printf("Saved system prompt to %s", promptPath)
 	}
-	os.WriteFile(timestampPath, []byte(system), 0644)
+	os.WriteFile(timestampPath, []byte(system), 0o600)
 }
 
 func extractMessages(body []byte, apiType string) []string {
@@ -1513,13 +1604,14 @@ func writeRequestLog(logBase, apiType, model, system string, messages []string, 
 
 	buf.WriteString("## Response\n\n")
 
-	if err := os.WriteFile(logBase+".md", buf.Bytes(), 0644); err != nil {
+	if err := os.WriteFile(logBase+".md", buf.Bytes(), 0o600); err != nil {
 		log.Printf("Failed to write log: %v", err)
 	} else {
 		log.Printf("Logged request to %s.md", logBase)
 	}
-	// Also save raw JSON for debugging
-	os.WriteFile(logBase+".req.json", rawBody, 0644)
+	// Also save raw JSON for debugging (with secrets redacted)
+	redactedBody := redactSecrets(rawBody)
+	os.WriteFile(logBase+".req.json", redactedBody, 0o600)
 }
 
 func writeMetadata(logBase, apiType, model string, statusCode int, latency time.Duration, reqSize int) {
@@ -1538,7 +1630,7 @@ func writeMetadata(logBase, apiType, model string, statusCode int, latency time.
 		ReqBytes:   reqSize,
 	}
 	data, _ := json.Marshal(m)
-	os.WriteFile(logBase+".meta.json", data, 0644)
+	os.WriteFile(logBase+".meta.json", data, 0o600)
 }
 
 func appendResponse(logBase, text string) {
@@ -1550,12 +1642,12 @@ func appendResponse(logBase, text string) {
 	// Replace the "Response" section placeholder
 	updated := append(content, []byte(text)...)
 	updated = append(updated, '\n')
-	if err := os.WriteFile(filename, updated, 0644); err != nil {
+	if err := os.WriteFile(filename, updated, 0o600); err != nil {
 		log.Printf("Failed to append response: %v", err)
 	} else {
 		log.Printf("Appended response to %s", filename)
 	}
-	os.WriteFile(logBase+".resp.txt", []byte(text), 0644)
+	os.WriteFile(logBase+".resp.txt", []byte(text), 0o600)
 }
 
 func copyHeaders(dst, src http.Header) {
@@ -2286,7 +2378,7 @@ func frameType(payload []byte) string {
 
 func saveWSTraffic(cfg *Config, host, direction string, payload []byte) {
 	agentLogDir := filepath.Join(cfg.LogDir, cfg.AgentType)
-	os.MkdirAll(agentLogDir, 0755)
+	os.MkdirAll(agentLogDir, 0o700)
 	timestamp := time.Now().Format("20060102-150405")
 	logFile := filepath.Join(agentLogDir, fmt.Sprintf("%s-ws-%s-%s.json", timestamp, host, direction))
 
@@ -2312,5 +2404,5 @@ func saveWSTraffic(cfg *Config, host, direction string, payload []byte) {
 	entries = append(entries, envelopeJSON)
 
 	out, _ := json.MarshalIndent(entries, "", "  ")
-	os.WriteFile(logFile, out, 0644)
+	os.WriteFile(logFile, out, 0o600)
 }
