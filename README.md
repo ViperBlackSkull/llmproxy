@@ -139,6 +139,8 @@ curl http://localhost:8765/v1/messages \
 
 Transparent wrapping (the default `llmproxy <agent>` flow) is unchanged: traffic to the agent's real original destination still passes through with the agent's own credentials — injection only applies to requests that target the proxy itself.
 
+Copy-paste wiring guides for individual agents — Claude Code, Codex, OpenCode, and Pi — live in [`docs/agents/`](docs/agents/) (start with the [Agent Setup Overview](docs/agents/README.md)).
+
 ### Standalone Mode
 
 Run the proxy daemon directly (no wrapper):
