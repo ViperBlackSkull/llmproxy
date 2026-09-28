@@ -766,6 +766,8 @@ func proxyPassthrough(cfg *Config, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	copyHeaders(req.Header, r.Header)
+	// Same as handleProxy: keep the response decodable by our own writer.
+	req.Header.Del("Accept-Encoding")
 	cfg.injectAPIKey(req, apiType)
 
 	resp, err := http.DefaultClient.Do(req)
@@ -775,7 +777,7 @@ func proxyPassthrough(cfg *Config, w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	copyHeaders(w.Header(), resp.Header)
+	copyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 }
@@ -834,6 +836,10 @@ func handleProxy(cfg *Config, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	copyHeaders(req.Header, r.Header)
+	// Do not forward the client's Accept-Encoding: the capture/stream
+	// path below assumes a plain-text body. Without it, Go's transport
+	// negotiates gzip itself and transparently decodes the response.
+	req.Header.Del("Accept-Encoding")
 	req.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
 	cfg.injectAPIKey(req, apiType)
 
@@ -849,7 +855,7 @@ func handleProxy(cfg *Config, w http.ResponseWriter, r *http.Request) {
 	log.Printf("<- %d %s (%s)", resp.StatusCode, path, latency.Round(time.Millisecond))
 
 	// Stream response to client while capturing it
-	copyHeaders(w.Header(), resp.Header)
+	copyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
 	isStream := isStreamingRequest(body, path)
@@ -1061,26 +1067,30 @@ func proxyAndCapture(w http.ResponseWriter, resp *http.Response, logBase string,
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		io.Copy(w, resp.Body)
+		var captured bytes.Buffer
+		io.Copy(io.MultiWriter(w, &captured), resp.Body)
+		appendResponse(logBase, extractStreamedText(captured.Bytes(), apiType))
 		return
 	}
 
+	// Byte-exact streaming: forward chunks as they arrive and flush.
+	// The body must never be reinterpreted here — SSE framing, or any
+	// binary content encoding, has to reach the client untouched. (The
+	// previous line-scanner rewrote frames and injected an extra newline
+	// after every "data:" line, which corrupted gzip responses outright
+	// and desynced keep-alive connections.)
 	var captured bytes.Buffer
-	writer := io.MultiWriter(w, &captured)
-
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		fmt.Fprintf(writer, "%s\n", line)
-		if line == "" || strings.HasPrefix(line, "event:") {
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := io.MultiWriter(w, &captured).Write(buf[:n]); werr != nil {
+				break
+			}
 			flusher.Flush()
-			continue
 		}
-		if strings.HasPrefix(line, "data:") {
-			fmt.Fprintf(writer, "\n")
-			flusher.Flush()
+		if err != nil {
+			break
 		}
 	}
 
@@ -1654,6 +1664,19 @@ func copyHeaders(dst, src http.Header) {
 	for k, v := range src {
 		dst[k] = v
 	}
+}
+
+// copyResponseHeaders copies upstream response headers to the client,
+// minus the framing ones. Content-Length/Content-Encoding describe the
+// upstream body as received (possibly gzip-compressed, with the
+// compressed length); what we write is the decoded body, re-framed by
+// net/http. Forwarding the stale values makes keep-alive clients read
+// the wrong number of bytes and desync the connection.
+func copyResponseHeaders(dst, src http.Header) {
+	copyHeaders(dst, src)
+	dst.Del("Content-Length")
+	dst.Del("Content-Encoding")
+	dst.Del("Transfer-Encoding")
 }
 
 func getEnv(key, fallback string) string {

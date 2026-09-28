@@ -1,7 +1,14 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -193,9 +200,9 @@ func TestExtractStreamedTextAnthropic(t *testing.T) {
 		"delta": map[string]string{"text": "Hello"},
 	}) + "\n" +
 		"data: " + marshal(map[string]interface{}{
-			"type":  "content_block_delta",
-			"delta": map[string]string{"text": " world"},
-		}) + "\n")
+		"type":  "content_block_delta",
+		"delta": map[string]string{"text": " world"},
+	}) + "\n")
 	got := extractStreamedText(data, "anthropic")
 	if got != "Hello world" {
 		t.Errorf("anthropic stream = %q", got)
@@ -209,10 +216,10 @@ func TestExtractStreamedTextOpenAIChat(t *testing.T) {
 		},
 	}) + "\n" +
 		"data: " + marshal(map[string]interface{}{
-			"choices": []map[string]interface{}{
-				{"delta": map[string]string{"content": " there"}},
-			},
-		}) + "\n" +
+		"choices": []map[string]interface{}{
+			{"delta": map[string]string{"content": " there"}},
+		},
+	}) + "\n" +
 		"data: [DONE]\n")
 	got := extractStreamedText(data, "openai")
 	if got != "Hi there" {
@@ -226,12 +233,12 @@ func TestExtractStreamedTextResponsesAPI(t *testing.T) {
 		"delta": "Hello",
 	}) + "\n" +
 		"data: " + marshal(map[string]interface{}{
-			"type":  "response.output_text.delta",
-			"delta": " from Responses",
-		}) + "\n" +
+		"type":  "response.output_text.delta",
+		"delta": " from Responses",
+	}) + "\n" +
 		"data: " + marshal(map[string]interface{}{
-			"type": "response.output_text.done",
-		}) + "\n")
+		"type": "response.output_text.done",
+	}) + "\n")
 	got := extractStreamedText(data, "openai")
 	if got != "Hello from Responses" {
 		t.Errorf("responses stream = %q", got)
@@ -349,4 +356,85 @@ func TestIsStreamingRequest(t *testing.T) {
 func marshal(v interface{}) string {
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+// Regression test for streaming proxy correctness: the client must receive
+// the upstream body byte-exactly, on both route spellings, regardless of
+// how the upstream framed or compressed it. The old line-rewriting stream
+// loop corrupted gzip bodies outright ("terminated" in undici clients),
+// injected an extra newline after every SSE data: line, and forwarded a
+// stale Content-Length that desynced keep-alive connections.
+func TestProxyStreamsByteExact(t *testing.T) {
+	want := []byte(strings.Repeat(
+		"event: content_block_delta\ndata: {\"delta\":{\"text\":\"x\"}}\n\n", 30))
+
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	zw.Write(want)
+	zw.Close()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			Stream bool `json:"stream"`
+		}
+		json.Unmarshal(body, &req)
+		if !req.Stream {
+			t.Error("upstream: request body lost stream flag")
+		}
+		if r.URL.Path == "/messages" {
+			// z.ai shape: compressed body + explicit Content-Length
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Header().Set("Content-Length", strconv.Itoa(gz.Len()))
+			w.Write(gz.Bytes())
+			return
+		}
+		// /v1/messages shape: identity, chunked
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write(want)
+	}))
+	defer upstream.Close()
+
+	cfg := &Config{
+		ListenAddr: "127.0.0.1:0",
+		LogDir:     t.TempDir(),
+		AgentType:  "test",
+		Backends:   map[string]string{"anthropic": upstream.URL},
+		APIKeys:    map[string]string{"anthropic": "test-key"},
+	}
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handleProxy(cfg, w, r)
+	}))
+	defer proxy.Close()
+
+	client := proxy.Client()
+	for _, path := range []string{"/messages", "/v1/messages"} {
+		// three sequential requests: keep-alive connection reuse must
+		// survive the framing of the previous response
+		for i := 0; i < 3; i++ {
+			req, err := http.NewRequest("POST", proxy.URL+path,
+				strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Accept-Encoding", "gzip") // what undici/ai-sdk sends
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("%s req %d: %v", path, i+1, err)
+			}
+			got, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if !bytes.Equal(got, want) {
+				t.Errorf("%s req %d: body not byte-exact (got %d bytes, want %d)",
+					path, i+1, len(got), len(want))
+			}
+			if cl := resp.Header.Get("Content-Length"); cl != "" && cl != strconv.Itoa(len(want)) {
+				t.Errorf("%s req %d: stale Content-Length %s (body is %d bytes)", path, i+1, cl, len(want))
+			}
+			if ce := resp.Header.Get("Content-Encoding"); ce != "" {
+				t.Errorf("%s req %d: Content-Encoding %q leaked on decoded body", path, i+1, ce)
+			}
+		}
+	}
 }
