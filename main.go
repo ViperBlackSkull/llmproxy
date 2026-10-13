@@ -84,6 +84,11 @@ type Config struct {
 	// Per-provider API keys — only injected when Transparent=false or explicitly overridden
 	APIKeys map[string]string // "anthropic"|"openai"|"gemini" -> key
 
+	// Anthropic-protocol upstreams split on how they read the key: the first-party
+	// API and most gateways accept "x-api-key", but Bearer-only providers (e.g.
+	// opencode.ai/zen) 401 on it and require "Authorization: Bearer".
+	AnthropicAuthStyle string // "x-api-key" (default) | "bearer"
+
 	// MITM state
 	caCert    *x509.Certificate
 	caKey     *ecdsa.PrivateKey
@@ -189,7 +194,15 @@ func (c *Config) injectAPIKey(req *http.Request, apiType string) {
 	}
 	switch apiType {
 	case "anthropic":
-		req.Header.Set("x-api-key", key)
+		// Clear both first: a stale dummy from the box must never reach an
+		// upstream that reads the other header.
+		req.Header.Del("x-api-key")
+		req.Header.Del("Authorization")
+		if strings.EqualFold(c.AnthropicAuthStyle, "bearer") {
+			req.Header.Set("Authorization", "Bearer "+key)
+		} else {
+			req.Header.Set("x-api-key", key)
+		}
 	case "openai":
 		req.Header.Set("Authorization", "Bearer "+key)
 	case "gemini":
@@ -233,6 +246,7 @@ func main() {
 			"openai":    os.Getenv("OPENAI_API_KEY"),
 			"gemini":    os.Getenv("GEMINI_API_KEY"),
 		},
+		AnthropicAuthStyle: getEnv("ANTHROPIC_AUTH_STYLE", "x-api-key"),
 	}
 
 	// Detect self-referential backend URLs (would cause infinite loop)
